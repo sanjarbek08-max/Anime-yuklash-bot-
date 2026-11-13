@@ -382,20 +382,37 @@ async def show_list(uid: int, mid: int | None, kind: str, page: int) -> None:
                paged_kb(items, page, lambda i: f"a:{i}", lambda p: f"l:{kind}:{p}"))
 
 
+def rkb(rows: list) -> dict:
+    """Ekranning pastidagi doimiy klaviatura."""
+    return {"keyboard": [[{"text": t} for t in r] for r in rows], "resize_keyboard": True,
+            "is_persistent": True, "input_field_placeholder": "Anime kodi yoki nomini yozing..."}
+
+
+USER_BTN = {"top": "🏆 Reyting", "pop": "🔥 Ommabop", "all": "📚 Barcha animelar", "fav": "⭐ Saqlanganlar"}
+USER_BTN_REV = {v: k for k, v in USER_BTN.items()}
+B_ADMIN, B_MENU = "👑 Admin panel", "🏠 Menyu"
+ADMIN_BTN = {"ad:add": "➕ Anime qo'shish", "ad:pick:addep:0": "🎞 Qism qo'shish",
+             "ad:pick:del:0": "🗑 Anime o'chirish", "ad:pick:delep:0": "✂️ Qism o'chirish",
+             "ad:ch": "📢 Majburiy kanallar", "ad:news": "📣 E'lon kanali", "ad:stat": "📊 Statistika"}
+ADMIN_BTN_REV = {v: k for k, v in ADMIN_BTN.items()}
+ALL_BTN_TEXTS = set(USER_BTN.values()) | set(ADMIN_BTN.values()) | {B_ADMIN, B_MENU}
+
+
 def main_menu(uid: int) -> dict:
-    rows = [[btn("🏆 Reyting", "l:top:0"), btn("🔥 Ommabop", "l:pop:0")],
-            [btn("📚 Barcha animelar", "l:all:0"), btn("⭐ Saqlanganlar", "l:fav:0")]]
+    rows = [[USER_BTN["top"], USER_BTN["pop"]], [USER_BTN["all"], USER_BTN["fav"]]]
     if uid in ADMINS:
-        rows.append([btn("👑 Admin panel", "ad")])
-    return kb(rows)
+        rows.append([B_ADMIN])
+    return rkb(rows)
 
 
 MENU_TEXT = ("🎌 <b>Anime bot</b>\n\nAnime <b>kodini</b> yuboring (masalan: <code>12</code>) yoki "
-             "<b>nomini</b> yozib qidiring.")
+             "<b>nomini</b> yozib qidiring. Menyu pastdagi tugmalarda.")
 
 
 async def show_menu(uid: int, mid: int | None = None) -> None:
-    await show(uid, mid, MENU_TEXT, main_menu(uid))
+    if mid:
+        await safe("deleteMessage", chat_id=uid, message_id=mid)
+    await send(uid, MENU_TEXT, main_menu(uid))
 
 
 # ---------- admin: yordamchilar ----------
@@ -403,17 +420,15 @@ state: dict[int, dict] = {}  # admin bosqichlari
 
 
 def admin_kb() -> dict:
-    return kb([
-        [btn("➕ Anime qo'shish", "ad:add"), btn("🎞 Qism qo'shish", "ad:pick:addep:0")],
-        [btn("🗑 Anime o'chirish", "ad:pick:del:0"), btn("✂️ Qism o'chirish", "ad:pick:delep:0")],
-        [btn("📢 Majburiy kanallar", "ad:ch"), btn("📣 E'lon kanali", "ad:news")],
-        [btn("📊 Statistika", "ad:stat")],
-        [btn("🏠 Menyu", "menu")],
-    ])
+    t = ADMIN_BTN
+    return rkb([[t["ad:add"], t["ad:pick:addep:0"]], [t["ad:pick:del:0"], t["ad:pick:delep:0"]],
+                [t["ad:ch"], t["ad:news"]], [t["ad:stat"], B_MENU]])
 
 
 async def show_admin(uid: int, mid: int | None = None) -> None:
-    await show(uid, mid, "👑 <b>Admin panel</b>", admin_kb())
+    if mid:
+        await safe("deleteMessage", chat_id=uid, message_id=mid)
+    await send(uid, "👑 <b>Admin panel</b>\nTugmalar pastda.", admin_kb())
 
 
 def chat_ref(msg: dict):
@@ -735,8 +750,11 @@ async def on_message(msg: dict) -> None:
     reg_user(msg["from"])
     text = (msg.get("text") or "").strip()
 
-    if uid in ADMINS and uid in state and await admin_state(uid, msg):
-        return
+    if uid in ADMINS and uid in state:
+        if text in ALL_BTN_TEXTS:  # menyu tugmasi bosilsa, joriy bosqich bekor bo'ladi
+            state.pop(uid, None)
+        elif await admin_state(uid, msg):
+            return
 
     if text.startswith("/start"):
         payload = text.split(maxsplit=1)[1].strip() if " " in text else ""
@@ -747,7 +765,15 @@ async def on_message(msg: dict) -> None:
         return
     if await gate(uid):
         return
-    if text.startswith("/admin") and uid in ADMINS:
+    if text in USER_BTN_REV:
+        await show_list(uid, None, USER_BTN_REV[text], 0)
+    elif text == B_MENU:
+        await show_menu(uid)
+    elif uid in ADMINS and text == B_ADMIN:
+        await show_admin(uid)
+    elif uid in ADMINS and text in ADMIN_BTN_REV:
+        await on_admin_cb(uid, {}, ADMIN_BTN_REV[text])
+    elif text.startswith("/admin") and uid in ADMINS:
         await show_admin(uid)
     elif text.startswith("/menu") or text.startswith("/"):
         await show_menu(uid)
@@ -823,7 +849,7 @@ async def on_callback(cb: dict) -> None:
 
     await answer()
     if cmd == "menu":
-        await show_menu(uid, mid)
+        await show_menu(uid, None if (msg.get("photo") or msg.get("video") or msg.get("document")) else mid)
     elif cmd == "a":
         await send_card(uid, int(p[1]))
     elif cmd == "e":
