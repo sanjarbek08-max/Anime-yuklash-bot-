@@ -114,6 +114,19 @@ CREATE TABLE IF NOT EXISTS views(
     anime_id INTEGER, user_id INTEGER, PRIMARY KEY(anime_id, user_id)
 );
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS news_channels(chat_id INTEGER PRIMARY KEY, title TEXT);
+CREATE TABLE IF NOT EXISTS sched(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, creator INTEGER, src_chat INTEGER, src_msg INTEGER,
+    target TEXT, kind TEXT, hhmm TEXT, date TEXT, weekday INTEGER, next_run TEXT,
+    active INTEGER DEFAULT 1, created TEXT, last_run TEXT
+);
+CREATE TABLE IF NOT EXISTS bjobs(
+    id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT, src_chat INTEGER, src_msg INTEGER,
+    anime_id INTEGER, anime_new INTEGER, added INTEGER, target TEXT, status TEXT,
+    last_uid INTEGER DEFAULT 0, sent INTEGER DEFAULT 0, failed INTEGER DEFAULT 0,
+    blocked_n INTEGER DEFAULT 0, ch_done INTEGER DEFAULT 0, ch_ok INTEGER DEFAULT 0,
+    ch_fail INTEGER DEFAULT 0, notify INTEGER, created TEXT
+);
 """
 )
 db.commit()
@@ -141,11 +154,18 @@ esc = html.escape
 
 
 # ---------- Telegram API ----------
+class TGError(RuntimeError):
+    def __init__(self, desc: str, code: int = 0, retry: int = 0):
+        super().__init__(desc)
+        self.code, self.retry = code, retry
+
+
 async def tg(method: str, **params):
     r = await http.post(f"{API}/{method}", json=params, timeout=70)
     data = r.json()
     if not data.get("ok"):
-        raise RuntimeError(data.get("description") or f"{method} xato")
+        raise TGError(data.get("description") or f"{method} xato", data.get("error_code", 0),
+                      (data.get("parameters") or {}).get("retry_after", 0))
     return data["result"]
 
 
@@ -393,9 +413,11 @@ USER_BTN_REV = {v: k for k, v in USER_BTN.items()}
 B_ADMIN, B_MENU = "👑 Admin panel", "🏠 Menyu"
 ADMIN_BTN = {"ad:add": "➕ Anime qo'shish", "ad:pick:addep:0": "🎞 Qism qo'shish",
              "ad:pick:del:0": "🗑 Anime o'chirish", "ad:pick:delep:0": "✂️ Qism o'chirish",
-             "ad:ch": "📢 Majburiy kanallar", "ad:news": "📣 E'lon kanali", "ad:stat": "📊 Statistika"}
+             "ad:ch": "📢 Majburiy kanallar", "ad:news": "📣 E'lon kanallari",
+             "ad:bc": "📨 Xabar yuborish", "ad:sl": "⏰ Rejalangan xabarlar", "ad:stat": "📊 Statistika"}
 ADMIN_BTN_REV = {v: k for k, v in ADMIN_BTN.items()}
-ALL_BTN_TEXTS = set(USER_BTN.values()) | set(ADMIN_BTN.values()) | {B_ADMIN, B_MENU}
+ADMIN_BTN_REV["📣 E'lon kanali"] = "ad:news"  # eski yozuv (eski klaviatura uchun)
+ALL_BTN_TEXTS = set(USER_BTN.values()) | set(ADMIN_BTN_REV) | {B_ADMIN, B_MENU}
 
 
 def main_menu(uid: int) -> dict:
@@ -422,7 +444,7 @@ state: dict[int, dict] = {}  # admin bosqichlari
 def admin_kb() -> dict:
     t = ADMIN_BTN
     return rkb([[t["ad:add"], t["ad:pick:addep:0"]], [t["ad:pick:del:0"], t["ad:pick:delep:0"]],
-                [t["ad:ch"], t["ad:news"]], [t["ad:stat"], B_MENU]])
+                [t["ad:ch"], t["ad:news"]], [t["ad:bc"], t["ad:sl"]], [t["ad:stat"], B_MENU]])
 
 
 async def show_admin(uid: int, mid: int | None = None) -> None:
@@ -471,13 +493,27 @@ async def verify_channel(ref, need_post: bool = False) -> dict:
     return {"chat_id": ch["id"], "title": ch.get("title") or str(ch["id"]), "link": link or ""}
 
 
-async def announce(aid: int, new: bool, added: int) -> bool:
-    cid = get_set("news_channel")
-    if not cid:
-        return False
+# ---------- e'lon va xabar yuborish ----------
+TARGET_NAMES = {"users": "👥 Foydalanuvchilar", "channels": "📣 Kanallar", "both": "👥📣 Ikkalasi"}
+WEEKDAYS = ["Dushanba", "Seshanba", "Chorshanba", "Payshanba", "Juma", "Shanba", "Yakshanba"]
+job_lock = asyncio.Lock()
+
+
+def news_channels() -> list:
+    return db.execute("SELECT * FROM news_channels ORDER BY rowid").fetchall()
+
+
+def spawn(coro) -> None:
+    t = asyncio.create_task(coro)
+    tasks.add(t)
+    t.add_done_callback(tasks.discard)
+
+
+async def announce_to(chat_id: int, aid: int, new: bool, added: int) -> None:
+    """Anime e'lonini bitta chatga (foydalanuvchi yoki kanal) yuboradi."""
     a = db.execute("SELECT * FROM anime WHERE id=?", (aid,)).fetchone()
     if not a:
-        return False
+        return
     total = db.execute("SELECT COUNT(*) FROM episodes WHERE anime_id=?", (aid,)).fetchone()[0]
     head = "🆕 <b>Yangi anime!</b>" if new else f"🆕 <b>Yangi qism{'lar' if added > 1 else ''} qo'shildi!</b>"
     lines = [head, "", f"🎬 <b>{esc(a['title'])}</b>", f"🔢 Kod: <code>{aid}</code>"]
@@ -488,16 +524,187 @@ async def announce(aid: int, new: bool, added: int) -> bool:
         lines += ["", esc(a["descr"][:500])]
     markup = kb([[ubtn("▶️ Ko'rish", f"https://t.me/{BOT_USERNAME}?start=a{aid}")]])
     text = "\n".join(lines)
-    try:
-        if a["poster"]:
-            await tg("sendPhoto", chat_id=int(cid), photo=a["poster"], caption=text[:1020], parse_mode="HTML",
-                     reply_markup=markup)
+    if a["poster"]:
+        await tg("sendPhoto", chat_id=chat_id, photo=a["poster"], caption=text[:1020], parse_mode="HTML",
+                 reply_markup=markup)
+    else:
+        await send(chat_id, text, markup)
+
+
+def start_job(kind: str, target: str, notify: int, src_chat: int = 0, src_msg: int = 0,
+              anime_id: int = 0, anime_new: int = 0, added: int = 0) -> int:
+    cur = db.execute(
+        "INSERT INTO bjobs(kind,src_chat,src_msg,anime_id,anime_new,added,target,status,notify,created) "
+        "VALUES(?,?,?,?,?,?,?,'running',?,?)",
+        (kind, src_chat, src_msg, anime_id, anime_new, added, target, notify, today()))
+    db.commit()
+    spawn(run_job(cur.lastrowid))
+    return cur.lastrowid
+
+
+def resume_jobs() -> None:
+    """Server qayta ishga tushganda yarim qolgan yuborishlarni davom ettiradi."""
+    for r in db.execute("SELECT id FROM bjobs WHERE status='running'").fetchall():
+        spawn(run_job(r["id"]))
+
+
+async def deliver(job: sqlite3.Row, chat_id: int) -> str:
+    """'ok' | 'blocked' | 'fail'"""
+    for _ in range(4):
+        try:
+            if job["kind"] == "anime":
+                await announce_to(chat_id, job["anime_id"], bool(job["anime_new"]), job["added"] or 1)
+            else:
+                await tg("copyMessage", chat_id=chat_id, from_chat_id=job["src_chat"], message_id=job["src_msg"])
+            return "ok"
+        except TGError as e:
+            if e.code == 429:
+                await asyncio.sleep(min(e.retry or 1, 60) + 1)
+                continue
+            if e.code == 403 or any(x in str(e).lower() for x in ("blocked", "deactivated", "chat not found")):
+                return "blocked"
+            log.warning("yuborilmadi (%s): %s", chat_id, e)
+            return "fail"
+        except Exception as e:  # noqa: BLE001
+            log.warning("yuborishda xato (%s): %r", chat_id, e)
+            await asyncio.sleep(1)
+    return "fail"
+
+
+async def run_job(jid: int) -> None:
+    async with job_lock:
+        job = db.execute("SELECT * FROM bjobs WHERE id=?", (jid,)).fetchone()
+        if not job or job["status"] != "running":
+            return
+        sent, failed, blocked, last = job["sent"], job["failed"], job["blocked_n"], job["last_uid"]
+        ch_ok, ch_fail = job["ch_ok"], job["ch_fail"]
+        if job["target"] in ("channels", "both") and not job["ch_done"]:
+            for ch in news_channels():
+                if await deliver(job, ch["chat_id"]) == "ok":
+                    ch_ok += 1
+                else:
+                    ch_fail += 1
+            db.execute("UPDATE bjobs SET ch_done=1, ch_ok=?, ch_fail=? WHERE id=?", (ch_ok, ch_fail, jid))
+            db.commit()
+        if job["target"] in ("users", "both"):
+            while True:
+                rows = db.execute("SELECT user_id FROM users WHERE blocked=0 AND user_id>? ORDER BY user_id LIMIT 25",
+                                  (last,)).fetchall()
+                if not rows:
+                    break
+                for r in rows:
+                    res = await deliver(job, r["user_id"])
+                    if res == "ok":
+                        sent += 1
+                    elif res == "blocked":
+                        blocked += 1
+                        db.execute("UPDATE users SET blocked=1 WHERE user_id=?", (r["user_id"],))
+                    else:
+                        failed += 1
+                    last = r["user_id"]
+                    await asyncio.sleep(0.05)  # soniyasiga ~20 ta (Telegram limitidan past)
+                db.execute("UPDATE bjobs SET last_uid=?, sent=?, failed=?, blocked_n=? WHERE id=?",
+                           (last, sent, failed, blocked, jid))
+                db.commit()
+        db.execute("UPDATE bjobs SET status='done', last_uid=?, sent=?, failed=?, blocked_n=? WHERE id=?",
+                   (last, sent, failed, blocked, jid))
+        db.commit()
+    lines = ["✅ <b>Yuborish tugadi</b>" if job["kind"] == "copy" else "✅ <b>Anime e'loni yuborildi</b>"]
+    if job["target"] in ("users", "both"):
+        lines.append(f"👥 Yetib bordi: <b>{sent}</b> · botni bloklagan: {blocked} · xato: {failed}")
+    if job["target"] in ("channels", "both"):
+        lines.append(f"📣 Kanallar: <b>{ch_ok}</b> ta yuborildi, {ch_fail} ta xato" if ch_ok + ch_fail
+                     else "📣 E'lon kanallari qo'shilmagan")
+    if job["notify"]:
+        await safe("sendMessage", chat_id=job["notify"], text="\n".join(lines), parse_mode="HTML")
+
+
+# ---------- taymer ----------
+def naive_now() -> datetime:
+    return now_local().replace(tzinfo=None, second=0, microsecond=0)
+
+
+def fmt_dt(dt: datetime) -> str:
+    return dt.strftime("%Y-%m-%d %H:%M")
+
+
+def parse_dt(text: str) -> datetime:
+    for f in ("%Y-%m-%d %H:%M", "%d.%m.%Y %H:%M"):
+        try:
+            dt = datetime.strptime(text.strip(), f)
+            return dt
+        except ValueError:
+            pass
+    raise ValueError("Format noto'g'ri. Masalan: 2026-11-20 18:30 yoki 20.11.2026 18:30")
+
+
+def parse_hm(text: str) -> tuple[int, int]:
+    m = re.fullmatch(r"(\d{1,2})[:.](\d{2})", text.strip())
+    if not m or int(m[1]) > 23 or int(m[2]) > 59:
+        raise ValueError("Vaqtni shunday yozing: 09:00")
+    return int(m[1]), int(m[2])
+
+
+def first_run(kind: str, hh: int, mm: int, weekday: int | None = None) -> datetime:
+    now = naive_now()
+    dt = now.replace(hour=hh, minute=mm)
+    if kind == "daily":
+        return dt if dt > now else dt + timedelta(days=1)
+    dt += timedelta(days=(weekday - now.weekday()) % 7)
+    return dt if dt > now else dt + timedelta(days=7)
+
+
+def add_sched(uid: int, st: dict, dt: datetime) -> int:
+    cur = db.execute(
+        "INSERT INTO sched(creator,src_chat,src_msg,target,kind,hhmm,date,weekday,next_run,created) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?)",
+        (uid, st["src"][0], st["src"][1], st["target"], st["kind"], dt.strftime("%H:%M"),
+         dt.strftime("%Y-%m-%d") if st["kind"] == "once" else None, st.get("weekday"), fmt_dt(dt), today()))
+    db.commit()
+    return cur.lastrowid
+
+
+def sched_desc(s: sqlite3.Row) -> str:
+    if s["kind"] == "once":
+        return f"📅 {s['date']} {s['hhmm']}"
+    if s["kind"] == "daily":
+        return f"🔁 Har kuni {s['hhmm']}"
+    return f"🗓 Har {WEEKDAYS[s['weekday']].lower()} {s['hhmm']}"
+
+
+async def sched_tick() -> None:
+    now = naive_now()
+    for s in db.execute("SELECT * FROM sched WHERE active=1 AND next_run<=?", (fmt_dt(now),)).fetchall():
+        due = datetime.strptime(s["next_run"], "%Y-%m-%d %H:%M")
+        if (now - due).total_seconds() <= 3 * 3600:
+            start_job("copy", s["target"], s["creator"], s["src_chat"], s["src_msg"])
+            log.info("Rejali xabar #%s yuborilmoqda", s["id"])
         else:
-            await send(int(cid), text, markup)
-        return True
-    except Exception as e:  # noqa: BLE001
-        log.error("e'lon yuborilmadi: %s", e)
-        return False
+            await safe("sendMessage", chat_id=s["creator"],
+                       text=f"⚠️ Rejali xabar #{s['id']} ({s['next_run']}) bot o'chiq bo'lgani uchun o'tkazib yuborildi.")
+        if s["kind"] == "once":
+            db.execute("UPDATE sched SET active=0, last_run=? WHERE id=?", (fmt_dt(now), s["id"]))
+        else:
+            step = timedelta(days=1 if s["kind"] == "daily" else 7)
+            nxt = due + step
+            while nxt <= now:
+                nxt += step
+            db.execute("UPDATE sched SET next_run=?, last_run=? WHERE id=?", (fmt_dt(nxt), fmt_dt(now), s["id"]))
+        db.commit()
+
+
+async def scheduler() -> None:
+    while True:
+        try:
+            await sched_tick()
+        except Exception as e:  # noqa: BLE001
+            log.error("scheduler: %r", e)
+        await asyncio.sleep(30)
+
+
+def target_kb() -> dict:
+    return kb([[btn("👥 Foydalanuvchilarga", "ad:bt:users")], [btn("📣 Kanallarga", "ad:bt:channels")],
+               [btn("👥📣 Ikkalasiga", "ad:bt:both")], [btn("❌ Bekor qilish", "ad")]])
 
 
 def delete_anime(aid: int) -> None:
@@ -521,6 +728,8 @@ def stats_text() -> str:
         f"⭐ Baholar: <b>{q('SELECT COUNT(*) FROM ratings')}</b>",
         f"💾 Saqlashlar: <b>{q('SELECT COUNT(*) FROM favorites')}</b>",
         f"📢 Majburiy kanallar: <b>{q('SELECT COUNT(*) FROM channels')}</b>",
+        f"📣 E'lon kanallari: <b>{q('SELECT COUNT(*) FROM news_channels')}</b>",
+        f"⏰ Rejalangan xabarlar: <b>{q('SELECT COUNT(*) FROM sched WHERE active=1')}</b>",
     ]
     pop = list_items("pop", 0)[:5]
     if pop:
@@ -536,7 +745,7 @@ async def on_admin_cb(uid: int, msg: dict, data: str) -> None:
     chat_id, mid = uid, msg.get("message_id")
     p = data.split(":")
     sub = p[1] if len(p) > 1 else ""
-    if sub != "done":
+    if sub not in ("done", "bt", "bw", "bd", "bgo"):
         state.pop(uid, None)
 
     if sub == "":
@@ -577,9 +786,11 @@ async def on_admin_cb(uid: int, msg: dict, data: str) -> None:
         if st["n"] == 0:
             msg_t = "ℹ️ Qism qo'shilmadi."
         else:
-            ok = await announce(st["aid"], st["new"], st["n"])
-            msg_t = f"✅ Saqlandi. Qo'shilgan qismlar: {st['n']}.\n" + (
-                "📣 Kanalga e'lon yuborildi." if ok else "📣 E'lon yuborilmadi (E'lon kanali sozlanmagan yoki xato).")
+            start_job("anime", "both" if st["new"] else "channels", uid, anime_id=st["aid"],
+                      anime_new=int(st["new"]), added=st["n"])
+            msg_t = f"✅ Saqlandi. Qo'shilgan qismlar: {st['n']}.\n📣 " + (
+                "E'lon hamma foydalanuvchilarga va E'lon kanallariga yuborilmoqda..." if st["new"]
+                else "E'lon E'lon kanallariga yuborilmoqda...")
         await show(uid, mid, f"{msg_t}\n🔢 Anime kodi: <code>{st['aid']}</code>", kb([[btn("👑 Admin panel", "ad")]]))
 
     elif sub == "dela":
@@ -631,23 +842,110 @@ async def on_admin_cb(uid: int, msg: dict, data: str) -> None:
         await on_admin_cb(uid, msg, "ad:ch")
 
     elif sub == "news":
-        cid = get_set("news_channel")
-        cur = f"Hozirgi: <code>{cid}</code>" if cid else "Hozircha o'rnatilmagan."
-        rows = [[btn("✏️ O'rnatish / almashtirish", "ad:newsset")]]
-        if cid:
-            rows.append([btn("🗑 O'chirish", "ad:newsoff")])
-        rows.append([btn("🔙 Orqaga", "ad")])
-        await show(uid, mid, f"📣 <b>E'lon kanali</b>\nYangi anime/qism qo'shilganda shu kanalga xabar boradi.\n\n{cur}",
-                   kb(rows))
+        chs = news_channels()
+        rows = [[btn(f"🗑 {c['title']}"[:50], f"ad:nd:{c['chat_id']}")] for c in chs]
+        rows += [[btn("➕ Kanal qo'shish", "ad:newsset")], [btn("🔙 Orqaga", "ad")]]
+        await show(uid, mid, "📣 <b>E'lon kanallari</b>\nYangi anime qo'shilganda va «📨 Xabar yuborish» da «Kanallarga» "
+                             "tanlanganda xabar shu kanallarga boradi.\n" + (
+                             "Kanalni olib tashlash uchun tugmasini bosing." if chs else "\nHozircha kanal yo'q."), kb(rows))
 
     elif sub == "newsset":
         state[uid] = {"s": "news"}
-        await show(uid, mid, "📣 E'lon kanalining <b>@username</b>ini yuboring yoki undan postni <b>forward</b> qiling.\n"
-                             "Bot u yerda <b>admin</b> bo'lishi kerak.", kb([[btn("❌ Bekor qilish", "ad:news")]]))
+        await show(uid, mid, "📣 Kanalning <b>@username</b>ini yuboring yoki undan postni <b>forward</b> qiling.\n"
+                             "Bot u yerda <b>admin</b> bo'lib, xabar yubora olishi kerak.",
+                   kb([[btn("❌ Bekor qilish", "ad:news")]]))
 
-    elif sub == "newsoff":
-        set_set("news_channel", "")
+    elif sub == "nd":
+        db.execute("DELETE FROM news_channels WHERE chat_id=?", (int(p[2]),))
+        db.commit()
         await on_admin_cb(uid, msg, "ad:news")
+
+    elif sub == "bc":
+        state[uid] = {"s": "bc_msg"}
+        await show(uid, mid, "📨 <b>Xabar yuborish</b>\n\nYubormoqchi bo'lgan xabaringizni shu yerga yuboring: matn, rasm, "
+                             "video, stiker, ovozli xabar, fayl... (hammasi bo'ladi).\n"
+                             "⚠️ Albom emas, bittadan yuboring.", kb([[btn("❌ Bekor qilish", "ad")]]))
+
+    elif sub == "bt":  # ad:bt:<users|channels|both>
+        st = state.get(uid)
+        if not st or st.get("s") != "bc_pick":
+            return
+        tgt = p[2]
+        users_n = db.execute("SELECT COUNT(*) FROM users WHERE blocked=0").fetchone()[0]
+        ch_n = len(news_channels())
+        if tgt in ("channels", "both") and ch_n == 0:
+            await show(uid, mid, "❌ E'lon kanali yo'q. Avval «📣 E'lon kanallari» bo'limida kanal qo'shing "
+                                 "yoki «Foydalanuvchilarga» ni tanlang.", target_kb())
+            return
+        st["target"] = tgt
+        await show(uid, mid, f"🎯 Qabul qiluvchi: <b>{TARGET_NAMES[tgt]}</b>\n"
+                             f"(👥 {users_n} ta foydalanuvchi, 📣 {ch_n} ta kanal)\n\nQachon yuboramiz?",
+                   kb([[btn("🚀 Hozir yuborish", "ad:bw:now")], [btn("📅 Bir marta (sana, vaqt)", "ad:bw:once")],
+                       [btn("🔁 Har kuni", "ad:bw:daily"), btn("🗓 Har hafta", "ad:bw:weekly")],
+                       [btn("❌ Bekor qilish", "ad")]]))
+
+    elif sub == "bw":  # ad:bw:<now|once|daily|weekly>
+        st = state.get(uid)
+        if not st or st.get("s") not in ("bc_pick", "bc_dt", "bc_t") or "target" not in st:
+            return
+        when = p[2]
+        cancel = kb([[btn("❌ Bekor qilish", "ad")]])
+        if when == "now":
+            st["s"] = "bc_pick"
+            await show(uid, mid, f"🚀 <b>{TARGET_NAMES[st['target']]}</b> ga hoziroq yuboriladi. Tasdiqlaysizmi?",
+                       kb([[btn("✅ Ha, yuborish", "ad:bgo"), btn("❌ Yo'q", "ad")]]))
+        elif when == "once":
+            st.update(s="bc_dt", kind="once")
+            await show(uid, mid, f"📅 Sana va vaqtni yozing (vaqt zonasi UTC+{TZ_HOURS}).\n"
+                                 "Masalan: <code>2026-11-20 18:30</code> yoki <code>20.11.2026 18:30</code>", cancel)
+        elif when == "daily":
+            st.update(s="bc_t", kind="daily")
+            await show(uid, mid, f"🔁 Har kuni qaysi vaqtda (UTC+{TZ_HOURS})? Masalan: <code>09:00</code>", cancel)
+        elif when == "weekly":
+            short = ["Dush", "Sesh", "Chor", "Pay", "Juma", "Shan", "Yak"]
+            btns = [btn(n, f"ad:bd:{i}") for i, n in enumerate(short)]
+            await show(uid, mid, "🗓 Haftaning qaysi kuni?",
+                       kb([btns[:4], btns[4:], [btn("❌ Bekor qilish", "ad")]]))
+
+    elif sub == "bd":  # hafta kuni tanlandi
+        st = state.get(uid)
+        if not st or "target" not in st:
+            return
+        st.update(s="bc_t", kind="weekly", weekday=int(p[2]))
+        await show(uid, mid, f"🗓 Har {WEEKDAYS[int(p[2])].lower()} qaysi vaqtda (UTC+{TZ_HOURS})? "
+                             "Masalan: <code>09:00</code>", kb([[btn("❌ Bekor qilish", "ad")]]))
+
+    elif sub == "bgo":
+        st = state.pop(uid, None)
+        if not st or "target" not in st or st.get("s") != "bc_pick":
+            return
+        start_job("copy", st["target"], uid, st["src"][0], st["src"][1])
+        await show(uid, mid, "🚀 Yuborish boshlandi. Tugagach hisobot keladi.", kb([[btn("👑 Admin panel", "ad")]]))
+
+    elif sub == "sl":
+        items = db.execute("SELECT * FROM sched WHERE active=1 ORDER BY next_run LIMIT 20").fetchall()
+        if not items:
+            await show(uid, mid, "⏰ Rejalangan xabarlar yo'q.",
+                       kb([[btn("📨 Yangi xabar", "ad:bc"), btn("🔙 Orqaga", "ad")]]))
+            return
+        lines = ["⏰ <b>Rejalangan xabarlar</b>", ""]
+        rows = []
+        for x in items:
+            lines.append(f"#{x['id']} · {sched_desc(x)} · {TARGET_NAMES[x['target']]}\n      ⏭ {x['next_run']}")
+            rows.append([btn(f"👁 #{x['id']}", f"ad:sv:{x['id']}"), btn(f"🗑 #{x['id']}", f"ad:sd:{x['id']}")])
+        rows.append([btn("📨 Yangi xabar", "ad:bc"), btn("🔙 Orqaga", "ad")])
+        await show(uid, mid, "\n".join(lines), kb(rows))
+
+    elif sub == "sv":  # rejalangan xabarni ko'rish
+        x = db.execute("SELECT * FROM sched WHERE id=?", (int(p[2]),)).fetchone()
+        if x and await safe("copyMessage", chat_id=uid, from_chat_id=x["src_chat"], message_id=x["src_msg"]):
+            return
+        await send(uid, "❌ Xabar topilmadi (suhbatdan o'chirib yuborilgan bo'lishi mumkin).")
+
+    elif sub == "sd":
+        db.execute("UPDATE sched SET active=0 WHERE id=?", (int(p[2]),))
+        db.commit()
+        await on_admin_cb(uid, msg, "ad:sl")
 
     elif sub == "stat":
         await show(uid, mid, stats_text(), kb([[btn("🔄 Yangilash", "ad:stat"), btn("🔙 Orqaga", "ad")]]))
@@ -712,6 +1010,38 @@ async def admin_state(uid: int, msg: dict) -> bool:
         db.commit()
         st["n"] += 1
         await send(uid, f"✅ {num}-qism saqlandi.", kb([[btn("✅ Tugatish", "ad:done")]]))
+    elif s == "bc_msg":
+        if not text and not any(k in msg for k in (
+                "photo", "video", "sticker", "voice", "audio", "document", "animation", "video_note", "poll")):
+            await send(uid, "Yubormoqchi bo'lgan xabaringizni yuboring:")
+            return True
+        mg = msg.get("media_group_id")
+        state[uid] = {"s": "bc_pick", "src": (msg["chat"]["id"], msg["message_id"]), "mg": mg}
+        note = "\n⚠️ Albom aniqlandi: faqat birinchi fayl yuboriladi." if mg else ""
+        await send(uid, "✅ Xabar qabul qilindi." + note + "\n\nKimga yuboramiz?", target_kb())
+    elif s == "bc_pick":
+        if msg.get("media_group_id") and msg.get("media_group_id") == st.get("mg"):
+            return True  # albomning qolgan qismlari
+        await send(uid, "Yuqoridagi tugmalardan birini tanlang yoki «❌ Bekor qilish» ni bosing.")
+    elif s in ("bc_dt", "bc_t"):
+        try:
+            if s == "bc_dt":
+                dt = parse_dt(text)
+                if dt <= naive_now():
+                    raise ValueError("Bu vaqt o'tib ketgan. Kelajakdagi vaqtni yozing.")
+            else:
+                hh, mm = parse_hm(text)
+                dt = first_run(st["kind"], hh, mm, st.get("weekday"))
+        except ValueError as e:
+            await send(uid, f"❌ {e}")
+            return True
+        sid = add_sched(uid, st, dt)
+        state.pop(uid, None)
+        row = db.execute("SELECT * FROM sched WHERE id=?", (sid,)).fetchone()
+        await send(uid, f"✅ <b>Rejalashtirildi</b> (#{sid})\n{sched_desc(row)}\n🎯 {TARGET_NAMES[row['target']]}\n"
+                        f"⏭ Keyingi yuborish: <b>{row['next_run']}</b>\n\n"
+                        "⚠️ Rejalangan xabarni shu suhbatdan o'chirmang, aks holda yuborilmaydi.",
+                   kb([[btn("⏰ Rejalangan xabarlar", "ad:sl")]]))
     elif s in ("chadd", "news"):
         ref = chat_ref(msg)
         if ref is None:
@@ -730,8 +1060,9 @@ async def admin_state(uid: int, msg: dict) -> bool:
             sub_cache.clear()
             await send(uid, f"✅ Majburiy kanal qo'shildi: <b>{esc(info['title'])}</b>", kb([[btn("📢 Kanallar", "ad:ch")]]))
         else:
-            set_set("news_channel", str(info["chat_id"]))
-            await send(uid, f"✅ E'lon kanali o'rnatildi: <b>{esc(info['title'])}</b>", kb([[btn("👑 Admin", "ad")]]))
+            db.execute("INSERT OR REPLACE INTO news_channels(chat_id,title) VALUES(?,?)", (info["chat_id"], info["title"]))
+            db.commit()
+            await send(uid, f"✅ E'lon kanali qo'shildi: <b>{esc(info['title'])}</b>", kb([[btn("📣 Kanallar", "ad:news")]]))
     return True
 
 
@@ -1027,16 +1358,27 @@ async def main() -> None:
     BOT_ID, BOT_USERNAME = me["id"], me["username"]
     await safe("setMyCommands", commands=[{"command": "start", "description": "Boshlash"},
                                           {"command": "menu", "description": "Asosiy menyu"}])
+    old = get_set("news_channel")  # eski versiyadagi yagona E'lon kanalini yangi ro'yxatga ko'chirish
+    if old and not news_channels():
+        title = old
+        try:
+            title = (await tg("getChat", chat_id=int(old))).get("title") or old
+        except Exception:  # noqa: BLE001
+            pass
+        db.execute("INSERT OR IGNORE INTO news_channels(chat_id,title) VALUES(?,?)", (int(old), title))
+        db.commit()
+        set_set("news_channel", "")
+    resume_jobs()
     log.info("Anime bot ishga tushdi: @%s | rejim: %s", BOT_USERNAME, "webhook" if WEBHOOK_MODE else "polling")
     if WEBHOOK_MODE:
         try:
             asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, lambda: asyncio.create_task(shutdown()))
         except NotImplementedError:
             pass
-        await asyncio.gather(serve_webhook(), backup_loop())
+        await asyncio.gather(serve_webhook(), backup_loop(), scheduler())
     else:
         await tg("deleteWebhook")
-        await asyncio.gather(poll(), backup_loop())
+        await asyncio.gather(poll(), backup_loop(), scheduler())
 
 
 if __name__ == "__main__":
