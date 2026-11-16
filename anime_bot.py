@@ -42,6 +42,7 @@ load_env()
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 _adm_list = [int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()]
 ADMINS = set(_adm_list)
+MAIN_ADMIN = _adm_list[0] if _adm_list else 0  # asosiy admin: boshqa admin qo'sha/o'chira oladi
 DB_PATH = os.environ.get("DB_PATH", "anime.db")
 TZ_HOURS = int(os.environ.get("TZ_OFFSET_HOURS", "5"))
 TG_HOST = os.environ.get("TG_API_HOST", "https://api.telegram.org")
@@ -114,6 +115,7 @@ CREATE TABLE IF NOT EXISTS views(
     anime_id INTEGER, user_id INTEGER, PRIMARY KEY(anime_id, user_id)
 );
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS admins(user_id INTEGER PRIMARY KEY, name TEXT);
 CREATE TABLE IF NOT EXISTS news_channels(chat_id INTEGER PRIMARY KEY, title TEXT);
 CREATE TABLE IF NOT EXISTS sched(
     id INTEGER PRIMARY KEY AUTOINCREMENT, creator INTEGER, src_chat INTEGER, src_msg INTEGER,
@@ -414,7 +416,8 @@ B_ADMIN, B_MENU = "👑 Admin panel", "🏠 Menyu"
 ADMIN_BTN = {"ad:add": "➕ Anime qo'shish", "ad:pick:addep:0": "🎞 Qism qo'shish",
              "ad:pick:del:0": "🗑 Anime o'chirish", "ad:pick:delep:0": "✂️ Qism o'chirish",
              "ad:ch": "📢 Majburiy kanallar", "ad:news": "📣 E'lon kanallari",
-             "ad:bc": "📨 Xabar yuborish", "ad:sl": "⏰ Rejalangan xabarlar", "ad:stat": "📊 Statistika"}
+             "ad:bc": "📨 Xabar yuborish", "ad:sl": "⏰ Rejalangan xabarlar", "ad:stat": "📊 Statistika",
+             "ad:am": "👥 Adminlar"}
 ADMIN_BTN_REV = {v: k for k, v in ADMIN_BTN.items()}
 ADMIN_BTN_REV["📣 E'lon kanali"] = "ad:news"  # eski yozuv (eski klaviatura uchun)
 ALL_BTN_TEXTS = set(USER_BTN.values()) | set(ADMIN_BTN_REV) | {B_ADMIN, B_MENU}
@@ -441,16 +444,21 @@ async def show_menu(uid: int, mid: int | None = None) -> None:
 state: dict[int, dict] = {}  # admin bosqichlari
 
 
-def admin_kb() -> dict:
+def admin_kb(uid: int = 0) -> dict:
     t = ADMIN_BTN
-    return rkb([[t["ad:add"], t["ad:pick:addep:0"]], [t["ad:pick:del:0"], t["ad:pick:delep:0"]],
-                [t["ad:ch"], t["ad:news"]], [t["ad:bc"], t["ad:sl"]], [t["ad:stat"], B_MENU]])
+    last = [t["ad:stat"], B_MENU]
+    if uid == MAIN_ADMIN:  # "Adminlar" tugmasi faqat asosiy adminda bor
+        last = [t["ad:stat"], t["ad:am"]], [B_MENU]
+    rows = [[t["ad:add"], t["ad:pick:addep:0"]], [t["ad:pick:del:0"], t["ad:pick:delep:0"]],
+            [t["ad:ch"], t["ad:news"]], [t["ad:bc"], t["ad:sl"]]]
+    rows += list(last) if isinstance(last, tuple) else [last]
+    return rkb(rows)
 
 
 async def show_admin(uid: int, mid: int | None = None) -> None:
     if mid:
         await safe("deleteMessage", chat_id=uid, message_id=mid)
-    await send(uid, "👑 <b>Admin panel</b>\nTugmalar pastda.", admin_kb())
+    await send(uid, "👑 <b>Admin panel</b>\nTugmalar pastda.", admin_kb(uid))
 
 
 def chat_ref(msg: dict):
@@ -748,8 +756,40 @@ async def on_admin_cb(uid: int, msg: dict, data: str) -> None:
     if sub not in ("done", "bt", "bw", "bd", "bgo"):
         state.pop(uid, None)
 
-    if sub == "":
+    if sub == "" :
         await show_admin(uid, mid)
+
+    elif sub in ("am", "amadd", "amdel", "amok") and uid != MAIN_ADMIN:
+        await send(uid, "⛔ Adminlarni faqat asosiy admin boshqara oladi.")
+
+    elif sub == "am":
+        rows_db = db.execute("SELECT * FROM admins ORDER BY rowid").fetchall()
+        lines = ["👥 <b>Adminlar</b>", "", f"👑 Asosiy admin: <code>{MAIN_ADMIN}</code>"]
+        extra_env = [a for a in _adm_list[1:]]
+        for a in extra_env:
+            lines.append(f"🔒 <code>{a}</code> (serverda belgilangan)")
+        rows = []
+        for a in rows_db:
+            lines.append(f"👤 {esc(a['name'] or '')} <code>{a['user_id']}</code>")
+            rows.append([btn(f"🗑 {a['name'] or a['user_id']}"[:50], f"ad:amdel:{a['user_id']}")])
+        lines.append("\nQo'shilgan adminlar boshqa adminlarni tayinlay olmaydi.")
+        rows += [[btn("➕ Admin qo'shish", "ad:amadd")], [btn("🔙 Orqaga", "ad")]]
+        await show(uid, mid, "\n".join(lines), kb(rows))
+
+    elif sub == "amadd":
+        state[uid] = {"s": "amadd"}
+        await show(uid, mid, "➕ Yangi adminning <b>Telegram ID</b> raqamini yuboring, yoki uning botga yozgan "
+                             "<b>@username</b>ini, yoki undan biror xabarni <b>forward</b> qiling.\n"
+                             "⚠️ U avval botga /start bosgan bo'lishi kerak.", kb([[btn("❌ Bekor qilish", "ad:am")]]))
+
+    elif sub == "amdel":
+        t_id = int(p[2])
+        db.execute("DELETE FROM admins WHERE user_id=?", (t_id,))
+        db.commit()
+        if t_id not in _adm_list:
+            ADMINS.discard(t_id)
+            state.pop(t_id, None)
+        await on_admin_cb(uid, msg, "ad:am")
 
     elif sub == "add":
         state[uid] = {"s": "title", "d": {}}
@@ -1010,6 +1050,39 @@ async def admin_state(uid: int, msg: dict) -> bool:
         db.commit()
         st["n"] += 1
         await send(uid, f"✅ {num}-qism saqlandi.", kb([[btn("✅ Tugatish", "ad:done")]]))
+    elif s == "amadd":
+        if uid != MAIN_ADMIN:
+            state.pop(uid, None)
+            return True
+        new_id, name = None, ""
+        ff = msg.get("forward_from") or ((msg.get("forward_origin") or {}).get("sender_user"))
+        if ff:
+            new_id, name = ff["id"], ff.get("first_name", "")
+        elif text.lstrip("-").isdigit():
+            new_id = int(text)
+        elif text.startswith("@"):
+            r = db.execute("SELECT user_id, first_name FROM users WHERE lower(username)=?", (text[1:].lower(),)).fetchone()
+            if r:
+                new_id, name = r["user_id"], r["first_name"]
+        if not new_id:
+            await send(uid, "❌ Topilmadi. ID raqam yuboring, yoki u botga /start bosganini tekshirib @username yozing, "
+                            "yoki undan xabar forward qiling:")
+            return True
+        r = db.execute("SELECT first_name FROM users WHERE user_id=?", (new_id,)).fetchone()
+        if not r:
+            await send(uid, "❌ Bu foydalanuvchi botga hali /start bosmagan. Avval u botni ochsin, keyin qayta urining.")
+            return True
+        name = name or r["first_name"] or ""
+        state.pop(uid, None)
+        if new_id in ADMINS:
+            await send(uid, "ℹ️ Bu foydalanuvchi allaqachon admin.", kb([[btn("👥 Adminlar", "ad:am")]]))
+            return True
+        db.execute("INSERT OR REPLACE INTO admins(user_id,name) VALUES(?,?)", (new_id, name))
+        db.commit()
+        ADMINS.add(new_id)
+        await send(uid, f"✅ Admin qo'shildi: <b>{esc(name)}</b> (<code>{new_id}</code>)", kb([[btn("👥 Adminlar", "ad:am")]]))
+        await safe("sendMessage", chat_id=new_id, text="👑 Siz botga admin qilindingiz. /start bosing.",
+                   parse_mode="HTML")
     elif s == "bc_msg":
         if not text and not any(k in msg for k in (
                 "photo", "video", "sticker", "voice", "audio", "document", "animation", "video_note", "poll")):
@@ -1368,6 +1441,8 @@ async def main() -> None:
         db.execute("INSERT OR IGNORE INTO news_channels(chat_id,title) VALUES(?,?)", (int(old), title))
         db.commit()
         set_set("news_channel", "")
+    for a in db.execute("SELECT user_id FROM admins").fetchall():
+        ADMINS.add(a["user_id"])
     resume_jobs()
     log.info("Anime bot ishga tushdi: @%s | rejim: %s", BOT_USERNAME, "webhook" if WEBHOOK_MODE else "polling")
     if WEBHOOK_MODE:
