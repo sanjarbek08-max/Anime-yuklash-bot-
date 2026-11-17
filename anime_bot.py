@@ -131,6 +131,13 @@ CREATE TABLE IF NOT EXISTS bjobs(
 );
 """
 )
+for _col in ("phone TEXT", "joined_at TEXT", "seen_at TEXT"):
+    try:
+        db.execute(f"ALTER TABLE users ADD COLUMN {_col}")
+    except sqlite3.OperationalError:
+        pass  # ustun allaqachon bor
+db.commit()
+
 db.commit()
 
 
@@ -150,6 +157,10 @@ def now_local() -> datetime:
 
 def today() -> str:
     return now_local().strftime("%Y-%m-%d")
+
+
+def now_str() -> str:
+    return now_local().strftime("%Y-%m-%d %H:%M")
 
 
 esc = html.escape
@@ -222,11 +233,11 @@ def reg_user(u: dict) -> None:
     name = u.get("first_name") or ""
     r = db.execute("SELECT 1 FROM users WHERE user_id=?", (uid,)).fetchone()
     if r:
-        db.execute("UPDATE users SET first_name=?, username=?, last_seen=?, blocked=0 WHERE user_id=?",
-                   (name, u.get("username") or "", today(), uid))
+        db.execute("UPDATE users SET first_name=?, username=?, last_seen=?, seen_at=?, blocked=0 WHERE user_id=?",
+                   (name, u.get("username") or "", today(), now_str(), uid))
     else:
-        db.execute("INSERT INTO users(user_id,first_name,username,joined,last_seen) VALUES(?,?,?,?,?)",
-                   (uid, name, u.get("username") or "", today(), today()))
+        db.execute("INSERT INTO users(user_id,first_name,username,joined,last_seen,joined_at,seen_at) VALUES(?,?,?,?,?,?,?)",
+                   (uid, name, u.get("username") or "", today(), today(), now_str(), now_str()))
     db.commit()
 
 
@@ -417,7 +428,7 @@ ADMIN_BTN = {"ad:add": "➕ Anime qo'shish", "ad:pick:addep:0": "🎞 Qism qo'sh
              "ad:pick:del:0": "🗑 Anime o'chirish", "ad:pick:delep:0": "✂️ Qism o'chirish",
              "ad:ch": "📢 Majburiy kanallar", "ad:news": "📣 E'lon kanallari",
              "ad:bc": "📨 Xabar yuborish", "ad:sl": "⏰ Rejalangan xabarlar", "ad:stat": "📊 Statistika",
-             "ad:am": "👥 Adminlar"}
+             "ad:am": "👥 Adminlar", "ad:us": "👤 Foydalanuvchilar"}
 ADMIN_BTN_REV = {v: k for k, v in ADMIN_BTN.items()}
 ADMIN_BTN_REV["📣 E'lon kanali"] = "ad:news"  # eski yozuv (eski klaviatura uchun)
 ALL_BTN_TEXTS = set(USER_BTN.values()) | set(ADMIN_BTN_REV) | {B_ADMIN, B_MENU}
@@ -427,7 +438,11 @@ def main_menu(uid: int) -> dict:
     rows = [[USER_BTN["top"], USER_BTN["pop"]], [USER_BTN["all"], USER_BTN["fav"]]]
     if uid in ADMINS:
         rows.append([B_ADMIN])
-    return rkb(rows)
+    m = rkb(rows)
+    r = db.execute("SELECT phone FROM users WHERE user_id=?", (uid,)).fetchone()
+    if not (r and r["phone"]):  # raqam hali berilmagan bo'lsa, ixtiyoriy tugma
+        m["keyboard"].append([{"text": "📱 Raqamimni yuborish", "request_contact": True}])
+    return m
 
 
 MENU_TEXT = ("🎌 <b>Anime bot</b>\n\nAnime <b>kodini</b> yuboring (masalan: <code>12</code>) yoki "
@@ -446,12 +461,10 @@ state: dict[int, dict] = {}  # admin bosqichlari
 
 def admin_kb(uid: int = 0) -> dict:
     t = ADMIN_BTN
-    last = [t["ad:stat"], B_MENU]
-    if uid == MAIN_ADMIN:  # "Adminlar" tugmasi faqat asosiy adminda bor
-        last = [t["ad:stat"], t["ad:am"]], [B_MENU]
     rows = [[t["ad:add"], t["ad:pick:addep:0"]], [t["ad:pick:del:0"], t["ad:pick:delep:0"]],
-            [t["ad:ch"], t["ad:news"]], [t["ad:bc"], t["ad:sl"]]]
-    rows += list(last) if isinstance(last, tuple) else [last]
+            [t["ad:ch"], t["ad:news"]], [t["ad:bc"], t["ad:sl"]], [t["ad:us"], t["ad:stat"]]]
+    # "Adminlar" tugmasi faqat asosiy adminda bor
+    rows.append([t["ad:am"], B_MENU] if uid == MAIN_ADMIN else [B_MENU])
     return rkb(rows)
 
 
@@ -722,6 +735,110 @@ def delete_anime(aid: int) -> None:
     db.commit()
 
 
+# ---------- foydalanuvchilar ma'lumoti ----------
+U_FILTERS = {
+    "all": ("📋 Hammasi", "1=1", "u.rowid DESC"),
+    "act": ("🟢 Faol (bloklamagan)", "u.blocked=0", "u.last_seen DESC, u.rowid DESC"),
+    "blk": ("🚫 Bloklaganlar", "u.blocked=1", "u.rowid DESC"),
+    "rec": ("🔥 Oxirgi 7 kunda faol", "u.blocked=0 AND u.last_seen>=?", "u.last_seen DESC, u.rowid DESC"),
+    "top": ("🏆 Eng ko'p anime ko'rganlar", "vc>0", "vc DESC, u.rowid DESC"),
+    "ph": ("📱 Raqami borlar", "u.phone IS NOT NULL AND u.phone<>''", "u.rowid DESC"),
+}
+
+
+def _users_query(flt: str) -> list:
+    _, cond, order = U_FILTERS[flt]
+    args = ((now_local() - timedelta(days=7)).strftime("%Y-%m-%d"),) if flt == "rec" else ()
+    sql = ("SELECT * FROM (SELECT u.rowid AS rid, u.*, (SELECT COUNT(*) FROM views v WHERE v.user_id=u.user_id) vc FROM users u) u "
+           f"WHERE {cond.replace('vc>0', 'u.vc>0')} ORDER BY {order.replace('vc DESC', 'u.vc DESC').replace('u.rowid', 'u.rid')}")
+    return db.execute(sql, args).fetchall()
+
+
+def users_summary() -> str:
+    q = lambda s, *a: db.execute(s, a).fetchone()[0]  # noqa: E731
+    week = (now_local() - timedelta(days=7)).strftime("%Y-%m-%d")
+    ph_n = q("SELECT COUNT(*) FROM users WHERE phone IS NOT NULL AND phone<>''")
+    return "\n".join([
+        "👤 <b>Foydalanuvchilar</b>", "",
+        f"👥 Jami: <b>{q('SELECT COUNT(*) FROM users')}</b>",
+        f"🟢 Faol (bloklamagan): <b>{q('SELECT COUNT(*) FROM users WHERE blocked=0')}</b>",
+        f"🚫 Botni bloklagan: <b>{q('SELECT COUNT(*) FROM users WHERE blocked=1')}</b>",
+        f"🔥 Oxirgi 7 kunda faol: <b>{q('SELECT COUNT(*) FROM users WHERE blocked=0 AND last_seen>=?', week)}</b>",
+        f"🎬 Anime ko'rganlar: <b>{q('SELECT COUNT(DISTINCT user_id) FROM views')}</b>",
+        f"📱 Raqami borlar: <b>{ph_n}</b>",
+        "", "Ro'yxatni tanlang:"])
+
+
+def users_filter_kb() -> dict:
+    rows = [[btn(v[0], f"ad:us:{k}:0")] for k, v in U_FILTERS.items()]
+    rows.append([btn("🔙 Orqaga", "ad")])
+    return kb(rows)
+
+
+def u_label(r) -> str:
+    st = "🚫" if r["blocked"] else "🟢"
+    name = (r["first_name"] or "Noma'lum")[:18]
+    un = f" @{r['username']}" if r["username"] else ""
+    return f"{st} {name}{un} · 🎬{r['vc']}"
+
+
+async def show_users(uid: int, mid: int | None, flt: str, page: int) -> None:
+    if flt not in U_FILTERS:
+        flt = "all"
+    rows_db = _users_query(flt)
+    title = U_FILTERS[flt][0]
+    if not rows_db:
+        await show(uid, mid, f"<b>{title}</b>\n\nBu bo'limda hozircha hech kim yo'q.",
+                   kb([[btn("🔙 Orqaga", "ad:us")]]))
+        return
+    per = 8
+    pages = max(1, math.ceil(len(rows_db) / per))
+    page = min(max(page, 0), pages - 1)
+    kbrows = [[btn(u_label(r), f"ad:uv:{r['user_id']}:{flt}:{page}")] for r in rows_db[page * per:(page + 1) * per]]
+    if pages > 1:
+        kbrows.append([btn("⬅️", f"ad:us:{flt}:{page - 1}") if page > 0 else btn("·", "noop"),
+                       btn(f"{page + 1}/{pages}", "noop"),
+                       btn("➡️", f"ad:us:{flt}:{page + 1}") if page < pages - 1 else btn("·", "noop")])
+    kbrows.append([btn("🔙 Orqaga", "ad:us")])
+    await show(uid, mid, f"<b>{title}</b> — {len(rows_db)} ta\n🟢 faol · 🚫 bloklagan · 🎬 ko'rgan anime soni\n"
+                         "Batafsil ko'rish uchun ustiga bosing.", kb(kbrows))
+
+
+async def show_user_card(uid: int, mid: int | None, tid: int, flt: str, page: int) -> None:
+    r = db.execute("SELECT * FROM users WHERE user_id=?", (tid,)).fetchone()
+    back = kb([[btn("🔙 Ro'yxatga", f"ad:us:{flt}:{page}")]])
+    if not r:
+        await show(uid, mid, "Foydalanuvchi topilmadi.", back)
+        return
+    titles = db.execute("SELECT a.id, a.title FROM views v JOIN anime a ON a.id=v.anime_id WHERE v.user_id=? "
+                        "ORDER BY a.title", (tid,)).fetchall()
+    ph = r["phone"] or ""
+    nm = esc(r["first_name"] or "Noma'lum")
+    ph_txt = f"<code>{esc(ph)}</code>" if ph else "yo'q (foydalanuvchi bermagan)"
+    lines = [
+        f"👤 <b>{nm}</b>",
+        f"🔗 Username: {('@' + esc(r['username'])) if r['username'] else '—'}",
+        f"🆔 ID: <code>{tid}</code>",
+        f"📱 Telefon: {ph_txt}",
+        f"📅 Ro'yxatdan o'tgan (start): <b>{r['joined_at'] or r['joined'] or '—'}</b>",
+        f"🕐 Oxirgi faolligi: <b>{r['seen_at'] or r['last_seen'] or '—'}</b>",
+        "📌 Holati: " + ("🚫 <b>botni bloklagan</b>" if r["blocked"] else "🟢 <b>faol</b>"),
+        "", f"🎬 Ko'rgan animelari: <b>{len(titles)}</b> ta",
+    ]
+    for a in titles[:40]:
+        lines.append(f"  • {esc(a['title'])} (kod {a['id']})")
+    if len(titles) > 40:
+        lines.append(f"  … va yana {len(titles) - 40} ta")
+    fav = db.execute("SELECT COUNT(*) FROM favorites WHERE user_id=?", (tid,)).fetchone()[0]
+    rat = db.execute("SELECT COUNT(*) FROM ratings WHERE user_id=?", (tid,)).fetchone()[0]
+    lines.append(f"\n⭐ Saqlagan: {fav} · baholagan: {rat}")
+    rows = []
+    if r["username"]:
+        rows.append([ubtn("💬 Profilini ochish", f"https://t.me/{r['username']}")])
+    rows.append([btn("🔙 Ro'yxatga", f"ad:us:{flt}:{page}")])
+    await show(uid, mid, "\n".join(lines), kb(rows))
+
+
 def stats_text() -> str:
     q = lambda s, *a: db.execute(s, a).fetchone()[0]  # noqa: E731
     t = today()
@@ -987,6 +1104,17 @@ async def on_admin_cb(uid: int, msg: dict, data: str) -> None:
         db.commit()
         await on_admin_cb(uid, msg, "ad:sl")
 
+    elif sub == "us":  # ad:us[:flt[:page]]
+        flt = p[2] if len(p) > 2 else ""
+        page = int(p[3]) if len(p) > 3 else 0
+        if not flt:
+            await show(uid, mid, users_summary(), users_filter_kb())
+        else:
+            await show_users(uid, mid, flt, page)
+
+    elif sub == "uv":  # ad:uv:<id>:<flt>:<page>
+        await show_user_card(uid, mid, int(p[2]), p[3] if len(p) > 3 else "all", int(p[4]) if len(p) > 4 else 0)
+
     elif sub == "stat":
         await show(uid, mid, stats_text(), kb([[btn("🔄 Yangilash", "ad:stat"), btn("🔙 Orqaga", "ad")]]))
 
@@ -1153,6 +1281,17 @@ async def on_message(msg: dict) -> None:
     uid = msg["from"]["id"]
     reg_user(msg["from"])
     text = (msg.get("text") or "").strip()
+
+    ct = msg.get("contact")
+    if ct:  # foydalanuvchi o'z raqamini ixtiyoriy ulashdi
+        if ct.get("user_id") == uid and ct.get("phone_number"):
+            ph = ct["phone_number"]
+            db.execute("UPDATE users SET phone=? WHERE user_id=?", (ph if ph.startswith("+") else "+" + ph, uid))
+            db.commit()
+            await send(uid, "✅ Raqamingiz saqlandi, rahmat!", main_menu(uid))
+        else:
+            await send(uid, "Faqat o'zingizning raqamingizni yuborishingiz mumkin.", main_menu(uid))
+        return
 
     if uid in ADMINS and uid in state:
         if text in ALL_BTN_TEXTS:  # menyu tugmasi bosilsa, joriy bosqich bekor bo'ladi
