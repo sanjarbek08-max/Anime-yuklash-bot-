@@ -131,7 +131,7 @@ CREATE TABLE IF NOT EXISTS bjobs(
 );
 """
 )
-for _col in ("phone TEXT", "joined_at TEXT", "seen_at TEXT"):
+for _col in ("phone TEXT", "joined_at TEXT", "seen_at TEXT", "chat_admin INTEGER", "chat_until TEXT"):
     try:
         db.execute(f"ALTER TABLE users ADD COLUMN {_col}")
     except sqlite3.OperationalError:
@@ -228,10 +228,12 @@ async def show(chat_id: int, mid: int | None, text: str, markup: dict | None = N
 
 
 # ---------- foydalanuvchilar ----------
-def reg_user(u: dict) -> None:
+def reg_user(u: dict) -> bool:
+    """Yangi foydalanuvchi bo'lsa True qaytaradi."""
     uid = u["id"]
     name = u.get("first_name") or ""
     r = db.execute("SELECT 1 FROM users WHERE user_id=?", (uid,)).fetchone()
+    is_new = not r
     if r:
         db.execute("UPDATE users SET first_name=?, username=?, last_seen=?, seen_at=?, blocked=0 WHERE user_id=?",
                    (name, u.get("username") or "", today(), now_str(), uid))
@@ -239,6 +241,7 @@ def reg_user(u: dict) -> None:
         db.execute("INSERT INTO users(user_id,first_name,username,joined,last_seen,joined_at,seen_at) VALUES(?,?,?,?,?,?,?)",
                    (uid, name, u.get("username") or "", today(), today(), now_str(), now_str()))
     db.commit()
+    return is_new
 
 
 # ---------- majburiy obuna ----------
@@ -267,16 +270,75 @@ async def missing_channels(uid: int) -> list:
     return miss
 
 
+pending: dict[int, str] = {}  # telefon kutilayotganda deep-link payload
+
+
+def has_phone(uid: int) -> bool:
+    r = db.execute("SELECT phone FROM users WHERE user_id=?", (uid,)).fetchone()
+    return bool(r and r["phone"])
+
+
+def user_line(r) -> str:
+    un = f"@{esc(r['username'])}" if r["username"] else "—"
+    return f"👤 <b>{esc(r['first_name'] or 'Noma' + chr(39) + 'lum')}</b>\n🔗 {un}\n🆔 <code>{r['user_id']}</code>"
+
+
+async def notify_main(uid: int, title: str) -> None:
+    """Asosiy adminga foydalanuvchi haqida xabar."""
+    r = db.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
+    if not r or not MAIN_ADMIN or uid in ADMINS:
+        return
+    ph = f"\n📱 <code>{esc(r['phone'])}</code>" if r["phone"] else ""
+    await safe("sendMessage", chat_id=MAIN_ADMIN, parse_mode="HTML",
+               text=f"{title}\n\n{user_line(r)}{ph}\n🕐 {now_str()}",
+               reply_markup=kb([[btn("✉️ Xabar yozish", f"ad:wr:{uid}")]]))
+
+
 async def gate(uid: int, payload: str = "-") -> bool:
     """Obuna bo'lmagan bo'lsa kanallar ro'yxatini yuboradi va True qaytaradi."""
     miss = await missing_channels(uid)
     if not miss:
-        return False
+        if uid in ADMINS or has_phone(uid):
+            return False
+        if payload != "-":
+            pending[uid] = payload
+        await tg("sendMessage", chat_id=uid, parse_mode="HTML",
+                 text="📱 <b>Ro'yxatdan o'tish</b>\n\nDavom etish uchun pastdagi <b>«📱 Raqamni ulashish»</b> tugmasini bosing. "
+                      "Raqamingiz Telegramdan o'zi yuboriladi, yozish shart emas.",
+                 reply_markup={"keyboard": [[{"text": "📱 Raqamni ulashish", "request_contact": True}]],
+                               "resize_keyboard": True, "one_time_keyboard": True})
+        return True
     rows = [[ubtn(f"📢 {c['title']}", c["link"])] for c in miss]
     rows.append([btn("✅ Tekshirish", f"chk:{payload}")])
     await send(uid, "Botdan foydalanish uchun avval quyidagi kanallarga obuna bo'ling, so'ng "
                     "<b>✅ Tekshirish</b> tugmasini bosing:", kb(rows))
     return True
+
+
+# ---------- admin bilan suhbat ----------
+def chat_deadline() -> str:
+    return (now_local() + timedelta(hours=24)).strftime("%Y-%m-%d %H:%M")
+
+
+def chat_open(uid: int) -> bool:
+    r = db.execute("SELECT chat_until FROM users WHERE user_id=?", (uid,)).fetchone()
+    return bool(r and r["chat_until"] and r["chat_until"] >= now_str())
+
+
+async def to_admin(uid: int, msg: dict) -> None:
+    """Foydalanuvchining xabarini suhbatni boshlagan adminga yetkazadi."""
+    r = db.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
+    admin = (r["chat_admin"] if r else 0) or MAIN_ADMIN
+    try:
+        await tg("sendMessage", chat_id=admin, parse_mode="HTML", text=f"💬 <b>Foydalanuvchidan xabar</b>\n{user_line(r)}")
+        await tg("copyMessage", chat_id=admin, from_chat_id=msg["chat"]["id"], message_id=msg["message_id"],
+                 reply_markup=kb([[btn("✉️ Javob berish", f"ad:wr:{uid}")]]))
+        db.execute("UPDATE users SET chat_until=? WHERE user_id=?", (chat_deadline(), uid))
+        db.commit()
+        await send(uid, "✅ Xabaringiz adminga yuborildi.", kb([[btn("❌ Suhbatni tugatish", "uc:x")]]))
+    except Exception as e:  # noqa: BLE001
+        log.warning("adminga yetkazilmadi: %r", e)
+        await send(uid, "❌ Xabarni yuborib bo'lmadi, keyinroq urinib ko'ring.")
 
 
 # ---------- anime kartasi ----------
@@ -438,11 +500,7 @@ def main_menu(uid: int) -> dict:
     rows = [[USER_BTN["top"], USER_BTN["pop"]], [USER_BTN["all"], USER_BTN["fav"]]]
     if uid in ADMINS:
         rows.append([B_ADMIN])
-    m = rkb(rows)
-    r = db.execute("SELECT phone FROM users WHERE user_id=?", (uid,)).fetchone()
-    if not (r and r["phone"]):  # raqam hali berilmagan bo'lsa, ixtiyoriy tugma
-        m["keyboard"].append([{"text": "📱 Raqamimni yuborish", "request_contact": True}])
-    return m
+    return rkb(rows)
 
 
 MENU_TEXT = ("🎌 <b>Anime bot</b>\n\nAnime <b>kodini</b> yuboring (masalan: <code>12</code>) yoki "
@@ -833,6 +891,8 @@ async def show_user_card(uid: int, mid: int | None, tid: int, flt: str, page: in
     rat = db.execute("SELECT COUNT(*) FROM ratings WHERE user_id=?", (tid,)).fetchone()[0]
     lines.append(f"\n⭐ Saqlagan: {fav} · baholagan: {rat}")
     rows = []
+    if not r["blocked"]:
+        rows.append([btn("✉️ Xabar yozish", f"ad:wr:{tid}")])
     if r["username"]:
         rows.append([ubtn("💬 Profilini ochish", f"https://t.me/{r['username']}")])
     rows.append([btn("🔙 Ro'yxatga", f"ad:us:{flt}:{page}")])
@@ -1112,6 +1172,20 @@ async def on_admin_cb(uid: int, msg: dict, data: str) -> None:
         else:
             await show_users(uid, mid, flt, page)
 
+    elif sub == "wr":  # ad:wr:<user_id> — foydalanuvchiga xabar yozish
+        tid = int(p[2])
+        r = db.execute("SELECT * FROM users WHERE user_id=?", (tid,)).fetchone()
+        if not r:
+            await send(uid, "Foydalanuvchi topilmadi.")
+            return
+        if r["blocked"]:
+            await send(uid, "🚫 Bu foydalanuvchi botni bloklagan, xabar yuborib bo'lmaydi.")
+            return
+        state[uid] = {"s": "wr", "to": tid}
+        await send(uid, f"✉️ <b>{esc(r['first_name'] or str(tid))}</b> ga yuboriladigan xabarni yozing "
+                        "(matn, rasm, video, stiker, ovoz...). Bekor qilish uchun /start yoki menyu tugmasini bosing.",
+                   kb([[btn("❌ Bekor qilish", "ad")]]))
+
     elif sub == "uv":  # ad:uv:<id>:<flt>:<page>
         await show_user_card(uid, mid, int(p[2]), p[3] if len(p) > 3 else "all", int(p[4]) if len(p) > 4 else 0)
 
@@ -1178,6 +1252,26 @@ async def admin_state(uid: int, msg: dict) -> bool:
         db.commit()
         st["n"] += 1
         await send(uid, f"✅ {num}-qism saqlandi.", kb([[btn("✅ Tugatish", "ad:done")]]))
+    elif s == "wr":
+        if not text and not any(k in msg for k in (
+                "photo", "video", "sticker", "voice", "audio", "document", "animation", "video_note", "poll")):
+            await send(uid, "Yuboriladigan xabarni yozing:")
+            return True
+        tid = st["to"]
+        state.pop(uid, None)
+        try:
+            await tg("copyMessage", chat_id=tid, from_chat_id=msg["chat"]["id"], message_id=msg["message_id"],
+                     reply_markup=kb([[btn("✍️ Javob yozish", "uc:r"), btn("❌ Suhbatni tugatish", "uc:x")]]))
+            db.execute("UPDATE users SET chat_admin=?, chat_until=? WHERE user_id=?", (uid, chat_deadline(), tid))
+            db.commit()
+            await send(uid, "✅ Yuborildi. U javob yozsa, shu yerga keladi.", kb([[btn("✉️ Yana yozish", f"ad:wr:{tid}")]]))
+        except TGError as e:
+            if e.code == 403:
+                db.execute("UPDATE users SET blocked=1 WHERE user_id=?", (tid,))
+                db.commit()
+                await send(uid, "🚫 Foydalanuvchi botni bloklagan, yuborilmadi.")
+            else:
+                await send(uid, f"❌ Yuborilmadi: {esc(str(e))}")
     elif s == "amadd":
         if uid != MAIN_ADMIN:
             state.pop(uid, None)
@@ -1279,18 +1373,26 @@ async def on_message(msg: dict) -> None:
     if msg["chat"]["type"] != "private" or "from" not in msg:
         return
     uid = msg["from"]["id"]
-    reg_user(msg["from"])
+    new_user = reg_user(msg["from"])
     text = (msg.get("text") or "").strip()
 
+    if new_user and uid not in ADMINS:
+        spawn(notify_main(uid, "🆕 <b>Yangi foydalanuvchi botga /start bosdi</b>"))
+
     ct = msg.get("contact")
-    if ct:  # foydalanuvchi o'z raqamini ixtiyoriy ulashdi
+    if ct:
         if ct.get("user_id") == uid and ct.get("phone_number"):
             ph = ct["phone_number"]
+            first = not has_phone(uid)
             db.execute("UPDATE users SET phone=? WHERE user_id=?", (ph if ph.startswith("+") else "+" + ph, uid))
             db.commit()
-            await send(uid, "✅ Raqamingiz saqlandi, rahmat!", main_menu(uid))
+            if first:
+                spawn(notify_main(uid, "✅ <b>Ro'yxatdan o'tdi (raqam berdi)</b>"))
+            await send(uid, "✅ Ro'yxatdan o'tdingiz, rahmat!", main_menu(uid))
+            if not await gate(uid):
+                await after_gate(uid, pending.pop(uid, ""))
         else:
-            await send(uid, "Faqat o'zingizning raqamingizni yuborishingiz mumkin.", main_menu(uid))
+            await gate(uid)
         return
 
     if uid in ADMINS and uid in state:
@@ -1307,6 +1409,10 @@ async def on_message(msg: dict) -> None:
         await after_gate(uid, payload)
         return
     if await gate(uid):
+        return
+    if uid not in ADMINS and chat_open(uid) and not (
+            text in USER_BTN_REV or text == B_MENU or text.startswith("/") or text.isdigit()):
+        await to_admin(uid, msg)
         return
     if text in USER_BTN_REV:
         await show_list(uid, None, USER_BTN_REV[text], 0)
@@ -1336,7 +1442,8 @@ async def on_message(msg: dict) -> None:
 
 async def on_callback(cb: dict) -> None:
     uid = cb["from"]["id"]
-    reg_user(cb["from"])
+    if reg_user(cb["from"]) and uid not in ADMINS:
+        spawn(notify_main(uid, "🆕 <b>Yangi foydalanuvchi botga kirdi</b>"))
     data = cb.get("data") or ""
     msg = cb.get("message") or {}
     mid = msg.get("message_id")
@@ -1362,12 +1469,25 @@ async def on_callback(cb: dict) -> None:
         await answer("✅ Rahmat!")
         if mid:
             await safe("deleteMessage", chat_id=uid, message_id=mid)
-        await after_gate(uid, "" if len(p) < 2 or p[1] == "-" else p[1])
+        pl = "" if len(p) < 2 or p[1] == "-" else p[1]
+        if not await gate(uid, pl or "-"):
+            await after_gate(uid, pl)
         return
 
-    if await missing_channels(uid):
+    if cmd == "uc":  # foydalanuvchi suhbati: uc:r (javob yozish), uc:x (tugatish)
+        if p[1] == "x":
+            db.execute("UPDATE users SET chat_until=NULL WHERE user_id=?", (uid,))
+            db.commit()
+            await answer("Suhbat tugatildi")
+        else:
+            db.execute("UPDATE users SET chat_until=? WHERE user_id=?", (chat_deadline(), uid))
+            db.commit()
+            await answer()
+            await send(uid, "✍️ Xabaringizni yozing (matn, rasm, ovoz...), adminga yetkazaman.")
+        return
+
+    if await gate(uid):
         await answer()
-        await gate(uid)
         return
 
     if cmd == "rs":  # baholash
