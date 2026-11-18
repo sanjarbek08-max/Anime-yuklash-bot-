@@ -21,15 +21,15 @@ h2{font-size:17px;margin:16px 2px 10px}h2 span{color:var(--pk);font-size:12px;ma
 .rail:active{animation-play-state:paused}
 @keyframes sl{to{transform:translateX(-50%)}}
 .c{background:var(--card);border-radius:20px;overflow:hidden;box-shadow:0 4px 14px #0002;position:relative}
-.rail .c{width:130px;flex:none}
-.p{aspect-ratio:9/16;background:linear-gradient(160deg,var(--pk2),#9fb4ff);display:flex;align-items:center;justify-content:center;font-size:56px;font-weight:800;color:#fff;position:relative}
-.p img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+.rail .c{flex:none}.rail .p{width:127px;height:190px}.rail .p.has{width:auto}.rail .p.has img{width:auto;height:190px}.rail .ci{width:0;min-width:100%}
+.p{aspect-ratio:2/3;background:linear-gradient(160deg,var(--pk2),#9fb4ff);display:flex;align-items:center;justify-content:center;font-size:56px;font-weight:800;color:#fff;position:relative}
+.p img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}.p.has{aspect-ratio:auto;display:block}.p.has span{display:none}.p.has img{position:static;display:block;width:100%;height:auto}
 .ci{padding:8px 10px 10px}.ci b{display:block;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .ci i{font-style:normal;font-size:12px;color:var(--sub)}
-.g{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.g{display:grid;grid-template-columns:1fr 1fr;gap:12px;align-items:start}
 .hb{position:absolute;top:8px;right:8px;width:34px;height:34px;border-radius:50%;border:0;background:#fffe;font-size:16px;z-index:2}
 .list .r{display:flex;gap:12px;align-items:center;background:var(--card);border-radius:16px;padding:8px;margin-bottom:10px}
-.list .r .p{width:54px;aspect-ratio:9/16;font-size:24px;border-radius:12px;overflow:hidden;flex:none}
+.list .r .p{width:70px;aspect-ratio:2/3;font-size:24px;border-radius:12px;overflow:hidden;flex:none}.list .r .p.has{aspect-ratio:auto}
 .rk{font-weight:800;color:var(--pk);width:22px;text-align:center}
 .nav{position:fixed;left:14px;right:14px;bottom:calc(12px + env(safe-area-inset-bottom,0px));z-index:5;max-width:612px;margin:auto;background:var(--card);border-radius:28px;display:flex;padding:6px;box-shadow:0 6px 24px #0003;backdrop-filter:blur(8px)}
 .nav button{flex:1;border:0;background:none;color:var(--sub);padding:8px 0;border-radius:22px;font-size:11px;font-weight:600}
@@ -38,7 +38,7 @@ h2{font-size:17px;margin:16px 2px 10px}h2 span{color:var(--pk);font-size:12px;ma
 .sb{background:var(--card);backdrop-filter:blur(14px);width:100%;max-width:640px;margin:auto;border-radius:28px 28px 0 0;padding:18px 18px 28px;max-height:88vh;overflow:auto;animation:up .3s}
 body.night .sb{background:#262057}body:not(.night) .sb{background:#fff}
 @keyframes up{from{transform:translateY(100%)}}
-.sr{display:flex;gap:14px}.sr .p{width:110px;flex:none;border-radius:18px;overflow:hidden;font-size:42px}
+.sr{display:flex;gap:14px}.sr .p{width:130px;flex:none;border-radius:18px;overflow:hidden;font-size:42px}
 .sr h3{margin:0 0 8px;font-size:20px}
 .ch{display:inline-block;background:#f06a9a22;border-radius:14px;padding:5px 10px;font-size:12px;margin:0 6px 6px 0}
 .ds{color:var(--sub);font-size:14px;line-height:1.5;margin:12px 0}
@@ -91,7 +91,7 @@ function rt(i){const n=+(i.dataset.n||0)+1;i.dataset.n=n;if(n>3)return i.remove(
 function loadAdmin(){if(window.openAdmin)return openAdmin();const e=document.createElement("script");e.src="/admin.js";e.onload=()=>openAdmin();document.head.appendChild(e)}
 // ---------- UI ----------
 const stars=a=>a.rt?`⭐ ${a.rt.toFixed(1)}`:"⭐ —";
-const poster=a=>`<div class="p">${esc((a.title||"?")[0].toUpperCase())}${a.hp?`<img loading="lazy" src="/poster/${a.id}" onerror="rt(this)">`:""}</div>`;
+const poster=a=>`<div class="p"><span>${esc((a.title||"?")[0].toUpperCase())}</span>${a.hp?`<img loading="lazy" src="/poster/${a.id}" onload="this.parentNode.classList.add('has')" onerror="rt(this)">`:""}</div>`;
 const card=(a,hb)=>`<div class="c" data-id="${a.id}">${hb?`<button class="hb" data-f="${a.id}">${a.fav?"❤️":"🤍"}</button>`:""}${poster(a)}<div class="ci"><b>${esc(a.title)}</b><i>👁 ${a.views} ${stars(a)} 📺 ${a.eps}</i></div></div>`;
 function render(){
  document.body.classList.toggle("night",night);$("#bn").textContent=night?"☀️":"🌙";
