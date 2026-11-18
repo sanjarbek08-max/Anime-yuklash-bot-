@@ -123,6 +123,7 @@ CREATE TABLE IF NOT EXISTS views(
 CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS admins(user_id INTEGER PRIMARY KEY, name TEXT);
 CREATE TABLE IF NOT EXISTS news_channels(chat_id INTEGER PRIMARY KEY, title TEXT);
+CREATE TABLE IF NOT EXISTS mychats(chat_id INTEGER PRIMARY KEY, title TEXT, type TEXT, username TEXT);
 CREATE TABLE IF NOT EXISTS sched(
     id INTEGER PRIMARY KEY AUTOINCREMENT, creator INTEGER, src_chat INTEGER, src_msg INTEGER,
     target TEXT, kind TEXT, hhmm TEXT, date TEXT, weekday INTEGER, next_run TEXT,
@@ -496,7 +497,8 @@ ADMIN_BTN = {"ad:add": "➕ Anime qo'shish", "ad:pick:addep:0": "🎞 Qism qo'sh
              "ad:pick:del:0": "🗑 Anime o'chirish", "ad:pick:delep:0": "✂️ Qism o'chirish",
              "ad:ch": "📢 Majburiy kanallar", "ad:news": "📣 E'lon kanallari",
              "ad:bc": "📨 Xabar yuborish", "ad:sl": "⏰ Rejalangan xabarlar", "ad:stat": "📊 Statistika",
-             "ad:am": "👥 Adminlar", "ad:us": "👤 Foydalanuvchilar"}
+             "ad:am": "👥 Adminlar", "ad:us": "👤 Foydalanuvchilar",
+             "ad:cm": "🛡 Kanal boshqaruvi"}
 ADMIN_BTN_REV = {v: k for k, v in ADMIN_BTN.items()}
 ADMIN_BTN_REV["📣 E'lon kanali"] = "ad:news"  # eski yozuv (eski klaviatura uchun)
 ALL_BTN_TEXTS = set(USER_BTN.values()) | set(ADMIN_BTN_REV) | {B_ADMIN, B_MENU}
@@ -531,7 +533,10 @@ def admin_kb(uid: int = 0) -> dict:
     rows = [[t["ad:add"], t["ad:pick:addep:0"]], [t["ad:pick:del:0"], t["ad:pick:delep:0"]],
             [t["ad:ch"], t["ad:news"]], [t["ad:bc"], t["ad:sl"]], [t["ad:us"], t["ad:stat"]]]
     # "Adminlar" tugmasi faqat asosiy adminda bor
-    rows.append([t["ad:am"], B_MENU] if uid == MAIN_ADMIN else [B_MENU])
+    if uid == MAIN_ADMIN:
+        rows += [[t["ad:am"], t["ad:cm"]], [B_MENU]]
+    else:
+        rows.append([B_MENU])
     return rkb(rows)
 
 
@@ -935,6 +940,325 @@ def stats_text() -> str:
 
 
 # ---------- admin: tugmalar ----------
+# ---------- Kanal boshqaruvi (faqat asosiy admin) ----------
+# (kalit, emoji, nomi, qaysi turda: c=kanal, g=guruh)
+CM_RIGHTS = [
+    ("can_delete_messages", "🗑", "Xabarlarni o'chirish", "cg"),
+    ("can_restrict_members", "🚫", "Foydalanuvchilarni bloklash", "cg"),
+    ("can_post_messages", "📣", "Xabar yuborish", "c"),
+    ("can_edit_messages", "✏️", "Xabarlarni tahrirlash / qadash", "c"),
+    ("can_pin_messages", "📌", "Xabarlarni qadash", "g"),
+    ("can_change_info", "📝", "Nom va tavsifni o'zgartirish", "cg"),
+    ("can_invite_users", "🔗", "Taklif havolasi", "cg"),
+    ("can_promote_members", "👑", "Admin tayinlash", "cg"),
+    ("can_manage_video_chats", "🎥", "Video chat", "cg"),
+    ("can_manage_topics", "🧵", "Mavzularni boshqarish", "g"),
+]
+CM_PROMPT = {
+    "del": "🗑 <b>Xabarni o'chirish</b>\n\nO'chirmoqchi bo'lgan xabarni shu yerga <b>forward</b> qiling yoki xabar "
+           "<b>havolasini</b> yuboring (<code>t.me/kanal/123</code>). Ketma-ket bir nechtasini yuborishingiz mumkin.",
+    "ban": "🚫 <b>Bloklash</b>\n\nFoydalanuvchining <b>ID</b> raqamini yuboring (yoki botga yozgan @username'ini, "
+           "yoki uning xabarini forward qiling). U shu chatdan bloklanadi.",
+    "unban": "♻️ <b>Blokdan chiqarish</b>\n\nFoydalanuvchi <b>ID</b> raqamini (yoki @username) yuboring.",
+    "pin": "📌 <b>Qadash</b>\n\nQadamoqchi bo'lgan xabarni forward qiling yoki havolasini yuboring.",
+    "unpin": "📍 <b>Qadashni olib tashlash</b>\n\nQadalgan xabarni forward qiling yoki havolasini yuboring.",
+    "title": "✏️ Yangi <b>nomni</b> yozing:",
+    "desc": "📝 Yangi <b>tavsifni</b> yozing (o'chirish uchun <code>-</code>):",
+    "post": "📣 Yubormoqchi bo'lgan xabaringizni yuboring (matn, rasm, video, fayl — hammasi bo'ladi).",
+}
+
+
+def cm_kind(ctype: str) -> str:
+    return "c" if ctype == "channel" else "g"
+
+
+def cm_has(m: dict, key: str) -> bool:
+    return m.get("status") == "creator" or bool(m.get(key))
+
+
+def cm_sum(ctype: str, m: dict) -> str:
+    k = cm_kind(ctype)
+    return " ".join(e + ("✅" if cm_has(m, key) else "❌") for key, e, _l, kinds in CM_RIGHTS if k in kinds)
+
+
+def cm_need(act: str, ctype: str) -> str:
+    pin = "can_edit_messages" if ctype == "channel" else "can_pin_messages"
+    return {"del": "can_delete_messages", "ban": "can_restrict_members", "unban": "can_restrict_members",
+            "pin": pin, "unpin": pin, "title": "can_change_info", "desc": "can_change_info",
+            "link": "can_invite_users", "post": "can_post_messages" if ctype == "channel" else ""}.get(act, "")
+
+
+def cm_save(ch: dict) -> None:
+    db.execute("INSERT OR REPLACE INTO mychats(chat_id,title,type,username) VALUES(?,?,?,?)",
+               (ch["id"], ch.get("title") or str(ch["id"]), ch.get("type") or "channel", ch.get("username") or ""))
+    db.commit()
+
+
+async def cm_member(cid: int) -> dict | None:
+    try:
+        m = await tg("getChatMember", chat_id=cid, user_id=BOT_ID)
+    except Exception:  # noqa: BLE001
+        return None
+    return m if m.get("status") in ("administrator", "creator") else None
+
+
+async def cm_info(cid: int):
+    r = db.execute("SELECT * FROM mychats WHERE chat_id=?", (cid,)).fetchone()
+    if not r:
+        cm_save(await tg("getChat", chat_id=cid))
+        r = db.execute("SELECT * FROM mychats WHERE chat_id=?", (cid,)).fetchone()
+    return r
+
+
+def cm_msg_ref(msg: dict):
+    """Forward qilingan kanal xabaridan yoki havoladan (chat, xabar_id) ni oladi."""
+    fo = msg.get("forward_origin") or {}
+    if fo.get("type") == "channel":
+        return fo["chat"]["id"], fo["message_id"]
+    if msg.get("forward_from_chat") and msg.get("forward_from_message_id"):
+        return msg["forward_from_chat"]["id"], msg["forward_from_message_id"]
+    t = (msg.get("text") or "").strip()
+    m = re.search(r"t\.me/c/(\d+)/(?:\d+/)?(\d+)", t)
+    if m:
+        return int("-100" + m.group(1)), int(m.group(2))
+    m = re.search(r"t\.me/([A-Za-z0-9_]{4,})/(?:\d+/)?(\d+)", t)
+    if m:
+        return "@" + m.group(1), int(m.group(2))
+    return None
+
+
+def cm_user_ref(msg: dict):
+    fo = msg.get("forward_origin") or {}
+    if fo.get("type") == "user":
+        return fo["sender_user"]["id"]
+    if msg.get("forward_from"):
+        return msg["forward_from"]["id"]
+    t = (msg.get("text") or "").strip()
+    if re.fullmatch(r"\d{4,}", t):
+        return int(t)
+    m = re.fullmatch(r"@([A-Za-z0-9_]{4,})", t)
+    if m:
+        r = db.execute("SELECT user_id FROM users WHERE lower(username)=?", (m.group(1).lower(),)).fetchone()
+        return r[0] if r else None
+    return None
+
+
+async def cm_list(uid: int, mid: int | None) -> None:
+    ids = {r[0] for r in db.execute("SELECT chat_id FROM mychats")}
+    ids |= {c["chat_id"] for c in channels()} | {c["chat_id"] for c in news_channels()}
+
+    async def one(cid: int):
+        m = await cm_member(cid)
+        if not m:
+            db.execute("DELETE FROM mychats WHERE chat_id=?", (cid,))
+            return None
+        try:
+            return await cm_info(cid), m
+        except Exception:  # noqa: BLE001
+            return None
+
+    got = [x for x in await asyncio.gather(*[one(c) for c in ids]) if x]
+    db.commit()
+    lines = ["🛡 <b>Kanal boshqaruvi</b>", "", f"Bot admin bo'lgan chatlar: <b>{len(got)}</b>", ""]
+    rows = []
+    for r, m in got:
+        ic = "📣" if r["type"] == "channel" else "👥"
+        un = f" @{r['username']}" if r["username"] else ""
+        lines.append(f"{ic} <b>{esc(r['title'])}</b>{un}\n<code>{r['chat_id']}</code>\n{cm_sum(r['type'], m)}\n")
+        rows.append([btn(f"{ic} {r['title']}"[:50], f"ad:cmc:{r['chat_id']}")])
+    if not got:
+        lines.append("Hozircha yo'q. Botni kanalga admin qiling yoki «➕ Chat qo'shish» ni bosing.")
+    rows += [[btn("➕ Chat qo'shish", "ad:cma"), btn("🔄 Yangilash", "ad:cm")], [btn("🔙 Orqaga", "ad")]]
+    await show(uid, mid, "\n".join(lines), kb(rows))
+
+
+async def cm_detail(uid: int, mid: int | None, cid: int) -> None:
+    back = kb([[btn("🔙 Kanallar", "ad:cm")]])
+    m = await cm_member(cid)
+    if not m:
+        db.execute("DELETE FROM mychats WHERE chat_id=?", (cid,))
+        db.commit()
+        await show(uid, mid, "❌ Bot bu chatda endi admin emas.", back)
+        return
+    try:
+        ch = await tg("getChat", chat_id=cid)
+        cm_save(ch)
+    except Exception:  # noqa: BLE001
+        r = await cm_info(cid)
+        ch = {"title": r["title"], "type": r["type"], "username": r["username"]}
+    n = await safe("getChatMemberCount", chat_id=cid)
+    k = cm_kind(ch.get("type", "channel"))
+    lines = [f"{'📣' if k == 'c' else '👥'} <b>{esc(ch.get('title') or '')}</b>", f"🆔 <code>{cid}</code>"]
+    if ch.get("username"):
+        lines.append(f"🔗 @{ch['username']}")
+    if n:
+        lines.append(f"👥 A'zolar: <b>{n}</b>")
+    lines += ["", "🤖 <b>Botning huquqlari:</b>"]
+    lines += [f"{'✅' if cm_has(m, key) else '❌'} {e} {lab}" for key, e, lab, kinds in CM_RIGHTS if k in kinds]
+    lines += ["", "Amallar bot huquqiga qarab chiqadi."]
+
+    def A(t: str, act: str) -> dict:
+        return btn(t, f"ad:cmx:{act}:{cid}")
+
+    acts = []
+    if cm_has(m, "can_delete_messages"):
+        acts.append(A("🗑 Xabar o'chirish", "del"))
+    if cm_has(m, "can_restrict_members"):
+        acts += [A("🚫 Bloklash", "ban"), A("♻️ Blokdan chiqarish", "unban")]
+    if cm_has(m, "can_edit_messages" if k == "c" else "can_pin_messages"):
+        acts += [A("📌 Qadash", "pin"), A("📍 Qadashni olib tashlash", "unpin")]
+    if cm_has(m, "can_change_info"):
+        acts += [A("✏️ Nomini o'zgartirish", "title"), A("📝 Tavsifni o'zgartirish", "desc")]
+    if cm_has(m, "can_invite_users"):
+        acts.append(A("🔗 Yangi havola", "link"))
+    if k == "g" or cm_has(m, "can_post_messages"):
+        acts.append(A("📣 Xabar yuborish", "post"))
+    acts.append(A("👥 Adminlar", "adm"))
+    rows = [acts[i:i + 2] for i in range(0, len(acts), 2)]
+    rows += [[btn("🔄 Yangilash", f"ad:cmc:{cid}")], [btn("🔙 Kanallar", "ad:cm")]]
+    await show(uid, mid, "\n".join(lines), kb(rows))
+
+
+async def cm_action(uid: int, mid: int | None, act: str, cid: int) -> None:
+    back = kb([[btn("🔙 Orqaga", f"ad:cmc:{cid}")]])
+    m = await cm_member(cid)
+    if not m:
+        await show(uid, mid, "❌ Bot bu chatda endi admin emas.", kb([[btn("🔙 Kanallar", "ad:cm")]]))
+        return
+    info = await cm_info(cid)
+    need = cm_need(act, info["type"])
+    if need and not cm_has(m, need):
+        await show(uid, mid, "❌ Botda bu amal uchun huquq yo'q. Kanalda botga kerakli huquqni bering.", back)
+        return
+    try:
+        if act == "link":
+            lk = await tg("createChatInviteLink", chat_id=cid, name="Bot")
+            await show(uid, mid, f"🔗 Yangi taklif havolasi:\n{lk['invite_link']}", back)
+        elif act == "adm":
+            adms = await tg("getChatAdministrators", chat_id=cid)
+            lines = [f"👥 <b>Adminlar</b> ({len(adms)})", ""]
+            for a in adms[:40]:
+                u = a["user"]
+                nm = esc((u.get("first_name") or "") + (" @" + u["username"] if u.get("username") else ""))
+                tag = "👑" if a["status"] == "creator" else ("🤖" if u.get("is_bot") else "⭐")
+                lines.append(f"{tag} {nm} <code>{u['id']}</code>")
+            await show(uid, mid, "\n".join(lines), back)
+        else:
+            state[uid] = {"s": "cm", "act": act, "cid": cid}
+            await show(uid, mid, CM_PROMPT[act], back)
+    except TGError as e:
+        await show(uid, mid, f"❌ Telegram xatosi: <code>{esc(str(e))}</code>", back)
+
+
+async def cm_state(uid: int, msg: dict, st: dict) -> bool:
+    act, cid = st["act"], st.get("cid")
+    text = (msg.get("text") or "").strip()
+    back = kb([[btn("🔙 Orqaga", f"ad:cmc:{cid}" if cid else "ad:cm")]])
+    if act == "add":
+        ref = chat_ref(msg)
+        try:
+            if ref is None:
+                raise ValueError
+            ch = await tg("getChat", chat_id=ref)
+        except Exception:  # noqa: BLE001
+            await send(uid, "❌ Chat topilmadi. Kanaldan xabar forward qiling yoki @username / ID yuboring.", back)
+            return True
+        if not await cm_member(ch["id"]):
+            await send(uid, "❌ Bot bu chatda admin emas. Avval botni admin qiling.", back)
+            return True
+        cm_save(ch)
+        state.pop(uid, None)
+        await cm_detail(uid, None, ch["id"])
+        return True
+    m = await cm_member(cid)
+    if not m:
+        state.pop(uid, None)
+        await send(uid, "❌ Bot bu chatda endi admin emas.", kb([[btn("🔙 Kanallar", "ad:cm")]]))
+        return True
+    info = await cm_info(cid)
+    need = cm_need(act, info["type"])
+    if need and not cm_has(m, need):
+        await send(uid, "❌ Botda bu amal uchun huquq yo'q.", back)
+        return True
+    try:
+        if act in ("del", "pin", "unpin"):
+            ref = cm_msg_ref(msg)
+            if not ref:
+                await send(uid, "❌ Xabarni forward qiling yoki havolasini yuboring (<code>t.me/kanal/123</code>).", back)
+                return True
+            rc, mid_ = ref
+            if isinstance(rc, str):
+                try:
+                    rc = (await tg("getChat", chat_id=rc))["id"]
+                except Exception:  # noqa: BLE001
+                    rc = None
+            if rc != cid:
+                await send(uid, "❌ Bu xabar tanlangan chatdan emas.", back)
+                return True
+            if act == "del":
+                await tg("deleteMessage", chat_id=cid, message_id=mid_)
+                ok = "🗑 Xabar o'chirildi."
+            elif act == "pin":
+                await tg("pinChatMessage", chat_id=cid, message_id=mid_, disable_notification=True)
+                ok = "📌 Xabar qadaldi."
+            else:
+                await tg("unpinChatMessage", chat_id=cid, message_id=mid_)
+                ok = "📍 Qadash olib tashlandi."
+            await send(uid, f"✅ {ok}\nYana yuborishingiz mumkin.", back)
+        elif act in ("ban", "unban"):
+            t = cm_user_ref(msg)
+            if not t:
+                await send(uid, "❌ ID, @username (botga yozgan bo'lsa) yoki forward qilingan xabar yuboring.", back)
+                return True
+            if t in ADMINS or t == BOT_ID:
+                await send(uid, "⛔ Adminni yoki botni bloklab bo'lmaydi.", back)
+                return True
+            if act == "ban":
+                await tg("banChatMember", chat_id=cid, user_id=t)
+                await send(uid, f"✅ <code>{t}</code> bloklandi.\nYana ID yuborishingiz mumkin.", back)
+            else:
+                await tg("unbanChatMember", chat_id=cid, user_id=t, only_if_banned=True)
+                await send(uid, f"✅ <code>{t}</code> blokdan chiqarildi.\nYana ID yuborishingiz mumkin.", back)
+        elif act in ("title", "desc"):
+            if not text:
+                await send(uid, "Matn yozing:", back)
+                return True
+            if act == "title":
+                await tg("setChatTitle", chat_id=cid, title=text[:128])
+            else:
+                await tg("setChatDescription", chat_id=cid, description="" if text == "-" else text[:255])
+            state.pop(uid, None)
+            await send(uid, "✅ O'zgartirildi.")
+            await cm_detail(uid, None, cid)
+        elif act == "post":
+            await tg("copyMessage", chat_id=cid, from_chat_id=uid, message_id=msg["message_id"])
+            await send(uid, "✅ Yuborildi. Yana yuborishingiz mumkin.", back)
+    except TGError as e:
+        await send(uid, f"❌ Telegram xatosi: <code>{esc(str(e))}</code>", back)
+    return True
+
+
+async def on_my_chat(mc: dict) -> None:
+    """Bot kanal/guruhda admin qilinsa yoki huquqi o'zgarsa, asosiy adminga xabar beradi."""
+    ch, new = mc["chat"], mc["new_chat_member"]
+    if ch.get("type") not in ("channel", "supergroup", "group") or not MAIN_ADMIN:
+        return
+    title = esc(ch.get("title") or str(ch["id"]))
+    old = (mc.get("old_chat_member") or {}).get("status")
+    if new.get("status") in ("administrator", "creator"):
+        cm_save(ch)
+        head = (f"🛡 Bot <b>{title}</b> da admin bo'ldi" if old not in ("administrator", "creator")
+                else f"🛡 Botning <b>{title}</b> dagi huquqlari o'zgardi")
+        await safe("sendMessage", chat_id=MAIN_ADMIN, parse_mode="HTML", text=f"{head}\n\n{cm_sum(ch['type'], new)}",
+                   reply_markup=kb([[btn("🛡 Boshqarish", f"ad:cmc:{ch['id']}")]]))
+    else:
+        db.execute("DELETE FROM mychats WHERE chat_id=?", (ch["id"],))
+        db.commit()
+        if old in ("administrator", "creator"):
+            await safe("sendMessage", chat_id=MAIN_ADMIN, parse_mode="HTML",
+                       text=f"⚠️ Bot <b>{title}</b> da endi admin emas.")
+
+
 async def on_admin_cb(uid: int, msg: dict, data: str) -> None:
     chat_id, mid = uid, msg.get("message_id")
     p = data.split(":")
@@ -976,6 +1300,24 @@ async def on_admin_cb(uid: int, msg: dict, data: str) -> None:
             ADMINS.discard(t_id)
             state.pop(t_id, None)
         await on_admin_cb(uid, msg, "ad:am")
+
+    elif sub.startswith("cm") and uid != MAIN_ADMIN:
+        await send(uid, "⛔ Kanal boshqaruvi faqat asosiy adminga ochiq.")
+
+    elif sub == "cm":
+        await cm_list(uid, mid)
+
+    elif sub == "cma":
+        state[uid] = {"s": "cm", "act": "add"}
+        await show(uid, mid, "➕ Chatni qo'shish uchun undan biror xabarni <b>forward</b> qiling yoki "
+                             "<b>@username</b> / <b>ID</b> yuboring.\nBot u yerda admin bo'lishi kerak.",
+                   kb([[btn("❌ Bekor qilish", "ad:cm")]]))
+
+    elif sub == "cmc":
+        await cm_detail(uid, mid, int(p[2]))
+
+    elif sub == "cmx":
+        await cm_action(uid, mid, p[2], int(p[3]))
 
     elif sub == "add":
         state[uid] = {"s": "title", "d": {}}
@@ -1220,6 +1562,9 @@ async def admin_state(uid: int, msg: dict) -> bool:
     if text.startswith("/"):
         state.pop(uid, None)
         return False
+
+    if s == "cm":
+        return await cm_state(uid, msg, st)
 
     if s == "title":
         if not text:
@@ -1545,6 +1890,8 @@ async def handle_update(u: dict) -> None:
             st = mc["new_chat_member"]["status"]
             db.execute("UPDATE users SET blocked=? WHERE user_id=?", (1 if st == "kicked" else 0, mc["chat"]["id"]))
             db.commit()
+        else:
+            await on_my_chat(mc)
 
 
 locks: dict[int, asyncio.Lock] = {}
