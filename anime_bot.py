@@ -7,6 +7,7 @@ reyting, baholash, saqlash, statistika, kanalga e'lon.
 - Bepul server: WEBHOOK_URL / RENDER_EXTERNAL_URL bo'lsa webhook rejimi + baza zaxirasi.
 """
 import asyncio
+import base64
 import hashlib
 import hmac
 import html
@@ -64,6 +65,7 @@ BACKUP_CHAT = int(os.environ.get("BACKUP_CHAT") or (_adm_list[0] if _adm_list el
 BACKUP_NAME = "anime.db"
 WEBAPP_URL = f"{WEBHOOK_BASE}/app" if WEBHOOK_MODE else ""  # Mini App havolasi (faqat webhook/Render rejimida)
 WEBAPP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webapp.html")
+ADMIN_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "admin.js")
 
 
 def restore_db_from_telegram() -> None:
@@ -1638,15 +1640,19 @@ def api_data(uid: int) -> dict:
         "(SELECT AVG(score) FROM ratings r WHERE r.anime_id=a.id) rt, "
         "(SELECT COUNT(*) FROM ratings r WHERE r.anime_id=a.id) rn, "
         "(SELECT score FROM ratings r WHERE r.anime_id=a.id AND r.user_id=?) my, "
-        "(SELECT 1 FROM favorites f WHERE f.anime_id=a.id AND f.user_id=?) fav "
-        "FROM anime a ORDER BY a.id DESC LIMIT 500", (uid, uid)).fetchall()
+        "(SELECT 1 FROM favorites f WHERE f.anime_id=a.id AND f.user_id=?) fav, "
+        "(SELECT 1 FROM views w WHERE w.anime_id=a.id AND w.user_id=?) seen "
+        "FROM anime a ORDER BY a.id DESC LIMIT 500", (uid, uid, uid)).fetchall()
     items = []
     for r in rows:
         d = dict(r)
         d["descr"] = (d["descr"] or "")[:600]
-        d["hp"], d["fav"] = bool(d["hp"]), 1 if d["fav"] else 0
+        d["hp"], d["fav"], d["seen"] = bool(d["hp"]), 1 if d["fav"] else 0, 1 if d["seen"] else 0
         items.append(d)
     return {"bot": BOT_USERNAME, "animes": items}
+
+
+poster_sem = asyncio.Semaphore(4)
 
 
 async def poster_bytes(aid: int) -> bytes | None:
@@ -1655,14 +1661,22 @@ async def poster_bytes(aid: int) -> bytes | None:
     r = db.execute("SELECT poster FROM anime WHERE id=?", (aid,)).fetchone()
     if not r or not r["poster"]:
         return None
-    f = await tg("getFile", file_id=r["poster"])
-    resp = await http.get(f"{TG_HOST}/file/bot{BOT_TOKEN}/{f['file_path']}", timeout=30)
-    if resp.status_code != 200:
-        return None
-    if len(poster_cache) > 300:
-        poster_cache.clear()
-    poster_cache[aid] = resp.content
-    return resp.content
+    async with poster_sem:
+        if aid in poster_cache:
+            return poster_cache[aid]
+        for i in range(3):
+            try:
+                f = await tg("getFile", file_id=r["poster"])
+                resp = await http.get(f"{TG_HOST}/file/bot{BOT_TOKEN}/{f['file_path']}", timeout=30)
+                if resp.status_code == 200 and resp.content:
+                    if len(poster_cache) > 300:
+                        poster_cache.clear()
+                    poster_cache[aid] = resp.content
+                    return resp.content
+            except Exception as e:  # noqa: BLE001
+                log.warning("poster %s (%s-urinish): %r", aid, i + 1, e)
+            await asyncio.sleep(1 + i)
+    return None
 
 
 def api_post(uid: int, path: str, body: dict) -> dict:
@@ -1681,6 +1695,161 @@ def api_post(uid: int, path: str, body: dict) -> dict:
         db.execute("INSERT OR REPLACE INTO ratings(user_id,anime_id,score) VALUES(?,?,?)", (uid, aid, score))
     db.commit()
     return {"ok": True}
+
+
+# ---------- Mini App: admin API ----------
+async def admin_api(uid: int, body: dict) -> dict:
+    if uid not in ADMINS:
+        return {"error": "Siz admin emassiz"}
+    a = body.get("a")
+    q = lambda s_, *p: db.execute(s_, p).fetchone()[0]  # noqa: E731
+    try:
+        if a == "stats":
+            t = today()
+            return {"users": q("SELECT COUNT(*) FROM users"), "today": q("SELECT COUNT(*) FROM users WHERE joined=?", t),
+                    "active": q("SELECT COUNT(*) FROM users WHERE last_seen=?", t),
+                    "blocked": q("SELECT COUNT(*) FROM users WHERE blocked=1"), "animes": q("SELECT COUNT(*) FROM anime"),
+                    "eps": q("SELECT COUNT(*) FROM episodes"), "ratings": q("SELECT COUNT(*) FROM ratings"),
+                    "favs": q("SELECT COUNT(*) FROM favorites"),
+                    "pop": [x[1] for x in list_items("pop", 0)[:5]], "top": [x[1] for x in list_items("top", 0)[:5]]}
+        if a == "users":
+            flt = body.get("flt") if body.get("flt") in U_FILTERS else "all"
+            sq = (body.get("s") or "").strip().lstrip("@").lower()
+            rows = [r for r in _users_query(flt)
+                    if not sq or sq in f"{r['first_name'] or ''} {r['username'] or ''} {r['user_id']}".lower()]
+            return {"total": len(rows), "filters": {k: v[0] for k, v in U_FILTERS.items()},
+                    "list": [{"id": r["user_id"], "n": r["first_name"] or "", "u": r["username"] or "",
+                              "b": r["blocked"], "vc": r["vc"]} for r in rows[:150]]}
+        if a == "user":
+            tid = int(body["id"])
+            r = db.execute("SELECT * FROM users WHERE user_id=?", (tid,)).fetchone()
+            if not r:
+                return {"error": "Topilmadi"}
+            w = db.execute("SELECT a.title FROM views v JOIN anime a ON a.id=v.anime_id WHERE v.user_id=? ORDER BY a.title",
+                           (tid,)).fetchall()
+            return {"id": tid, "n": r["first_name"], "u": r["username"], "ph": r["phone"],
+                    "j": r["joined_at"] or r["joined"], "s": r["seen_at"] or r["last_seen"], "b": r["blocked"],
+                    "w": [x[0] for x in w[:40]], "wn": len(w),
+                    "fav": q("SELECT COUNT(*) FROM favorites WHERE user_id=?", tid),
+                    "rat": q("SELECT COUNT(*) FROM ratings WHERE user_id=?", tid)}
+        if a == "msg_user":
+            tid, text = int(body["id"]), (body.get("text") or "").strip()[:3500]
+            if not text:
+                return {"error": "Matn yo'q"}
+            try:
+                await tg("sendMessage", chat_id=tid, text=text,
+                         reply_markup=kb([[btn("✍️ Javob yozish", "uc:r"), btn("❌ Suhbatni tugatish", "uc:x")]]))
+            except TGError as e:
+                if e.code == 403:
+                    db.execute("UPDATE users SET blocked=1 WHERE user_id=?", (tid,))
+                    db.commit()
+                return {"error": "Yuborilmadi: " + str(e)}
+            db.execute("UPDATE users SET chat_admin=?, chat_until=? WHERE user_id=?", (uid, chat_deadline(), tid))
+            db.commit()
+            return {"ok": True}
+        if a == "anime_add":
+            title = (body.get("title") or "").strip()[:200]
+            if not title:
+                return {"error": "Nomi kerak"}
+            poster = None
+            if body.get("poster"):
+                r = await http.post(f"{API}/sendPhoto", data={"chat_id": uid, "caption": f"🖼 Poster: {title}"},
+                                    files={"photo": ("p.jpg", base64.b64decode(body["poster"]))}, timeout=60)
+                res = r.json()
+                if res.get("ok"):
+                    poster = res["result"]["photo"][-1]["file_id"]
+            cur = db.execute("INSERT INTO anime(title,descr,genre,poster,created) VALUES(?,?,?,?,?)",
+                             (title, (body.get("descr") or "").strip()[:1500] or None,
+                              (body.get("genre") or "").strip()[:100] or None, poster, today()))
+            db.commit()
+            aid = cur.lastrowid
+            state[uid] = {"s": "eps", "aid": aid, "n": 0, "new": True}
+            await send(uid, f"✅ Anime yaratildi. 🔢 Kodi: <code>{aid}</code>\n\nEndi qismlarni <b>video</b> yoki <b>fayl</b> "
+                            "qilib ketma-ket yuboring (1-qismdan boshlab). Tugagach <b>✅ Tugatish</b> ni bosing.",
+                       kb([[btn("✅ Tugatish", "ad:done")]]))
+            return {"id": aid}
+        if a in ("ep_add", "eps", "ep_del", "anime_del"):
+            aid = int(body["id"])
+            an = db.execute("SELECT title FROM anime WHERE id=?", (aid,)).fetchone()
+            if not an:
+                return {"error": "Anime topilmadi"}
+            if a == "ep_add":
+                state[uid] = {"s": "eps", "aid": aid, "n": 0, "new": False}
+                await send(uid, f"🎞 <b>{esc(an['title'])}</b>\n\nEndi qismlarni <b>video</b> yoki <b>fayl</b> qilib "
+                                "ketma-ket yuboring.", kb([[btn("✅ Tugatish", "ad:done")]]))
+            elif a == "eps":
+                return {"nums": [r["num"] for r in db.execute("SELECT num FROM episodes WHERE anime_id=? ORDER BY num", (aid,))]}
+            elif a == "ep_del":
+                db.execute("DELETE FROM episodes WHERE anime_id=? AND num=?", (aid, int(body["num"])))
+                db.commit()
+            else:
+                delete_anime(aid)
+            return {"ok": True}
+        if a == "chs":
+            return {"ch": [{"id": c["chat_id"], "t": c["title"]} for c in channels()],
+                    "news": [{"id": c["chat_id"], "t": c["title"]} for c in news_channels()]}
+        if a == "ch_add":
+            news = body.get("kind") == "news"
+            ref = chat_ref({"text": str(body.get("ref") or "")})
+            if ref is None:
+                return {"error": "@username, havola yoki ID yozing"}
+            try:
+                info = await verify_channel(ref, need_post=news)
+            except ValueError as e:
+                return {"error": str(e)}
+            if news:
+                db.execute("INSERT OR REPLACE INTO news_channels(chat_id,title) VALUES(?,?)", (info["chat_id"], info["title"]))
+            else:
+                db.execute("INSERT OR REPLACE INTO channels(chat_id,title,link) VALUES(?,?,?)",
+                           (info["chat_id"], info["title"], info["link"]))
+            db.commit()
+            sub_cache.clear()
+            return {"ok": True}
+        if a == "ch_del":
+            db.execute(f"DELETE FROM {'news_channels' if body.get('kind') == 'news' else 'channels'} WHERE chat_id=?",
+                       (int(body["id"]),))
+            db.commit()
+            sub_cache.clear()
+            return {"ok": True}
+        if a == "bc":
+            text, tgt = (body.get("text") or "").strip()[:3900], body.get("target")
+            if not text or tgt not in TARGET_NAMES:
+                return {"error": "Matn yoki qabul qiluvchi noto'g'ri"}
+            if tgt in ("channels", "both") and not news_channels():
+                return {"error": "E'lon kanali yo'q. Avval «Kanallar» bo'limida qo'shing."}
+            m = await tg("sendMessage", chat_id=uid, text=text)
+            start_job("copy", tgt, uid, uid, m["message_id"])
+            return {"ok": True}
+        if a in ("adm", "adm_add", "adm_del"):
+            if uid != MAIN_ADMIN:
+                return {"error": "Adminlarni faqat asosiy admin boshqaradi"}
+            if a == "adm_add":
+                ref, r = str(body.get("ref") or "").strip(), None
+                if ref.lstrip("-").isdigit():
+                    r = db.execute("SELECT user_id, first_name FROM users WHERE user_id=?", (int(ref),)).fetchone()
+                elif ref.startswith("@"):
+                    r = db.execute("SELECT user_id, first_name FROM users WHERE lower(username)=?", (ref[1:].lower(),)).fetchone()
+                if not r:
+                    return {"error": "Topilmadi. U botga /start bosgan bo'lishi kerak."}
+                if r["user_id"] in ADMINS:
+                    return {"error": "Allaqachon admin"}
+                db.execute("INSERT OR REPLACE INTO admins(user_id,name) VALUES(?,?)", (r["user_id"], r["first_name"] or ""))
+                db.commit()
+                ADMINS.add(r["user_id"])
+                await safe("sendMessage", chat_id=r["user_id"], text="👑 Siz botga admin qilindingiz. /start bosing.")
+            elif a == "adm_del":
+                t = int(body["id"])
+                db.execute("DELETE FROM admins WHERE user_id=?", (t,))
+                db.commit()
+                if t not in _adm_list:
+                    ADMINS.discard(t)
+                    state.pop(t, None)
+            rows = db.execute("SELECT * FROM admins ORDER BY rowid").fetchall()
+            return {"main": MAIN_ADMIN, "env": _adm_list[1:], "list": [{"id": r["user_id"], "n": r["name"] or ""} for r in rows]}
+    except Exception as e:  # noqa: BLE001
+        log.error("admin_api %s: %r", a, e)
+        return {"error": "Xatolik: " + str(e)[:100]}
+    return {"error": "Noma'lum amal"}
 
 
 # ---------- webhook server ----------
@@ -1712,6 +1881,9 @@ async def web_conn(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -
             elif method in ("GET", "HEAD") and path in ("/app", "/app/"):
                 with open(WEBAPP_FILE, "rb") as f:
                     status, body, ctype, extra = 200, f.read(), "text/html; charset=utf-8", "Cache-Control: no-cache\r\n"
+            elif method in ("GET", "HEAD") and path == "/admin.js":
+                with open(ADMIN_FILE, "rb") as f:
+                    status, body, ctype, extra = 200, f.read(), "application/javascript; charset=utf-8", "Cache-Control: no-cache\r\n"
             elif method in ("GET", "HEAD") and path.startswith("/poster/") and path[8:].isdigit():
                 img = await poster_bytes(int(path[8:]))
                 if img:
@@ -1736,7 +1908,13 @@ async def web_conn(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -
                         reg_user(user)
                         out = api_data(user["id"])
                         out["user"] = {k: user.get(k) for k in ("id", "first_name", "username")}
+                        ur = db.execute("SELECT joined_at, joined FROM users WHERE user_id=?", (user["id"],)).fetchone()
+                        out["user"].update(joined=(ur["joined_at"] or ur["joined"]) if ur else None,
+                                           admin=user["id"] in ADMINS, main=user["id"] == MAIN_ADMIN)
                         status, body = 200, json.dumps(out, ensure_ascii=False).encode()
+                    elif method == "POST" and path == "/api/admin":
+                        res = await admin_api(user["id"], json.loads(raw or b"{}"))
+                        status, body = 200, json.dumps(res, ensure_ascii=False).encode()
                     elif method == "POST" and path in ("/api/fav", "/api/rate"):
                         status, body = 200, json.dumps(api_post(user["id"], path, json.loads(raw or b"{}"))).encode()
     except Exception as e:  # noqa: BLE001
