@@ -952,6 +952,9 @@ CM_RIGHTS = [
     ("can_invite_users", "🔗", "Taklif havolasi", "cg"),
     ("can_promote_members", "👑", "Admin tayinlash", "cg"),
     ("can_manage_video_chats", "🎥", "Video chat", "cg"),
+    ("can_post_stories", "📖", "Hikoya qo'yish", "cg"),
+    ("can_edit_stories", "🎞", "Hikoyalarni tahrirlash", "cg"),
+    ("can_delete_stories", "🧹", "Hikoyalarni o'chirish", "cg"),
     ("can_manage_topics", "🧵", "Mavzularni boshqarish", "g"),
 ]
 CM_PROMPT = {
@@ -965,6 +968,9 @@ CM_PROMPT = {
     "title": "✏️ Yangi <b>nomni</b> yozing:",
     "desc": "📝 Yangi <b>tavsifni</b> yozing (o'chirish uchun <code>-</code>):",
     "post": "📣 Yubormoqchi bo'lgan xabaringizni yuboring (matn, rasm, video, fayl — hammasi bo'ladi).",
+    "photo": "🖼 Yangi <b>rasmni</b> yuboring (rasm qilib).",
+    "mute": "🔇 <b>Jim qilish (24 soat)</b>\n\nFoydalanuvchi ID raqamini yuboring (yoki @username / forward).",
+    "unmute": "🔊 <b>Yozishga ruxsat berish</b>\n\nFoydalanuvchi ID raqamini yuboring.",
 }
 
 
@@ -985,7 +991,8 @@ def cm_need(act: str, ctype: str) -> str:
     pin = "can_edit_messages" if ctype == "channel" else "can_pin_messages"
     return {"del": "can_delete_messages", "ban": "can_restrict_members", "unban": "can_restrict_members",
             "pin": pin, "unpin": pin, "title": "can_change_info", "desc": "can_change_info",
-            "link": "can_invite_users", "post": "can_post_messages" if ctype == "channel" else ""}.get(act, "")
+            "link": "can_invite_users", "photo": "can_change_info", "delphoto": "can_change_info",
+            "unpinall": pin, "unpinallok": pin, "mute": "can_restrict_members", "unmute": "can_restrict_members", "post": "can_post_messages" if ctype == "channel" else ""}.get(act, "")
 
 
 def cm_save(ch: dict) -> None:
@@ -1095,7 +1102,8 @@ async def cm_detail(uid: int, mid: int | None, cid: int) -> None:
         lines.append(f"👥 A'zolar: <b>{n}</b>")
     lines += ["", "🤖 <b>Botning huquqlari:</b>"]
     lines += [f"{'✅' if cm_has(m, key) else '❌'} {e} {lab}" for key, e, lab, kinds in CM_RIGHTS if k in kinds]
-    lines += ["", "Amallar bot huquqiga qarab chiqadi."]
+    lines += ["", "ℹ️ Hikoya: Telegram botlarga kanalga hikoya qo'yishga ruxsat bermaydi, uni admin o'zi qo'yadi.",
+              "Amallar bot huquqiga qarab chiqadi."]
 
     def A(t: str, act: str) -> dict:
         return btn(t, f"ad:cmx:{act}:{cid}")
@@ -1105,10 +1113,13 @@ async def cm_detail(uid: int, mid: int | None, cid: int) -> None:
         acts.append(A("🗑 Xabar o'chirish", "del"))
     if cm_has(m, "can_restrict_members"):
         acts += [A("🚫 Bloklash", "ban"), A("♻️ Blokdan chiqarish", "unban")]
+        if k == "g":
+            acts += [A("🔇 Jim qilish (24 s)", "mute"), A("🔊 Ruxsat berish", "unmute")]
     if cm_has(m, "can_edit_messages" if k == "c" else "can_pin_messages"):
-        acts += [A("📌 Qadash", "pin"), A("📍 Qadashni olib tashlash", "unpin")]
+        acts += [A("📌 Qadash", "pin"), A("📍 Qadashni olib tashlash", "unpin"), A("📍 Hammasini olib tashlash", "unpinall")]
     if cm_has(m, "can_change_info"):
-        acts += [A("✏️ Nomini o'zgartirish", "title"), A("📝 Tavsifni o'zgartirish", "desc")]
+        acts += [A("✏️ Nomini o'zgartirish", "title"), A("📝 Tavsifni o'zgartirish", "desc"),
+                 A("🖼 Rasmni o'zgartirish", "photo"), A("🗑 Rasmni o'chirish", "delphoto")]
     if cm_has(m, "can_invite_users"):
         acts.append(A("🔗 Yangi havola", "link"))
     if k == "g" or cm_has(m, "can_post_messages"):
@@ -1143,6 +1154,15 @@ async def cm_action(uid: int, mid: int | None, act: str, cid: int) -> None:
                 tag = "👑" if a["status"] == "creator" else ("🤖" if u.get("is_bot") else "⭐")
                 lines.append(f"{tag} {nm} <code>{u['id']}</code>")
             await show(uid, mid, "\n".join(lines), back)
+        elif act == "delphoto":
+            await tg("deleteChatPhoto", chat_id=cid)
+            await show(uid, mid, "✅ Chat rasmi o'chirildi.", back)
+        elif act == "unpinall":
+            await show(uid, mid, "📍 Hamma qadalgan xabarlar olib tashlansinmi?",
+                       kb([[btn("✅ Ha", f"ad:cmx:unpinallok:{cid}")], [btn("❌ Yo'q", f"ad:cmc:{cid}")]]))
+        elif act == "unpinallok":
+            await tg("unpinAllChatMessages", chat_id=cid)
+            await show(uid, mid, "✅ Hamma xabar qadashdan olindi.", back)
         else:
             state[uid] = {"s": "cm", "act": act, "cid": cid}
             await show(uid, mid, CM_PROMPT[act], back)
@@ -1219,7 +1239,7 @@ async def cm_state(uid: int, msg: dict, st: dict) -> bool:
                 await tg("unpinChatMessage", chat_id=cid, message_id=mid_)
                 ok = "📍 Qadash olib tashlandi."
             await send(uid, f"✅ {ok}\nYana yuborishingiz mumkin.", back)
-        elif act in ("ban", "unban"):
+        elif act in ("ban", "unban", "mute", "unmute"):
             t = cm_user_ref(msg)
             if not t:
                 await send(uid, "❌ ID, @username (botga yozgan bo'lsa) yoki forward qilingan xabar yuboring.", back)
@@ -1229,10 +1249,36 @@ async def cm_state(uid: int, msg: dict, st: dict) -> bool:
                 return True
             if act == "ban":
                 await tg("banChatMember", chat_id=cid, user_id=t)
-                await send(uid, f"✅ <code>{t}</code> bloklandi.\nYana ID yuborishingiz mumkin.", back)
-            else:
+                dn = "bloklandi"
+            elif act == "unban":
                 await tg("unbanChatMember", chat_id=cid, user_id=t, only_if_banned=True)
-                await send(uid, f"✅ <code>{t}</code> blokdan chiqarildi.\nYana ID yuborishingiz mumkin.", back)
+                dn = "blokdan chiqarildi"
+            elif act == "mute":
+                await tg("restrictChatMember", chat_id=cid, user_id=t, permissions={"can_send_messages": False},
+                         until_date=int(time.time()) + 86400)
+                dn = "24 soatga jim qilindi"
+            else:
+                chx = await tg("getChat", chat_id=cid)
+                await tg("restrictChatMember", chat_id=cid, user_id=t,
+                         permissions=chx.get("permissions") or {"can_send_messages": True})
+                dn = "yana yozishi mumkin"
+            await send(uid, f"✅ <code>{t}</code> {dn}.\nYana ID yuborishingiz mumkin.", back)
+        elif act == "photo":
+            ph = (msg.get("photo") or [None])[-1]
+            doc = msg.get("document") or {}
+            fid = ph["file_id"] if ph else (doc.get("file_id") if str(doc.get("mime_type", "")).startswith("image/") else None)
+            if not fid:
+                await send(uid, "❌ Rasm yuboring.", back)
+                return True
+            f = await tg("getFile", file_id=fid)
+            data = (await http.get(f"{TG_HOST}/file/bot{BOT_TOKEN}/{f['file_path']}", timeout=60)).content
+            r = (await http.post(f"{API}/setChatPhoto", data={"chat_id": cid},
+                                 files={"photo": ("photo.jpg", data)}, timeout=60)).json()
+            if not r.get("ok"):
+                raise TGError(r.get("description") or "setChatPhoto xato", r.get("error_code", 0))
+            state.pop(uid, None)
+            await send(uid, "✅ Rasm o'zgartirildi.")
+            await cm_detail(uid, None, cid)
         elif act in ("title", "desc"):
             if not text:
                 await send(uid, "Matn yozing:", back)
