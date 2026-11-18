@@ -8,6 +8,7 @@ reyting, baholash, saqlash, statistika, kanalga e'lon.
 """
 import asyncio
 import hashlib
+import hmac
 import html
 import json
 import logging
@@ -17,6 +18,7 @@ import re
 import signal
 import sqlite3
 import time
+from urllib.parse import parse_qsl
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -60,6 +62,8 @@ BACKUP_ON = os.environ.get("BACKUP", "1" if WEBHOOK_MODE else "0") == "1"
 BACKUP_EVERY = int(os.environ.get("BACKUP_MINUTES", "10")) * 60
 BACKUP_CHAT = int(os.environ.get("BACKUP_CHAT") or (_adm_list[0] if _adm_list else 0))
 BACKUP_NAME = "anime.db"
+WEBAPP_URL = f"{WEBHOOK_BASE}/app" if WEBHOOK_MODE else ""  # Mini App havolasi (faqat webhook/Render rejimida)
+WEBAPP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webapp.html")
 
 
 def restore_db_from_telegram() -> None:
@@ -500,7 +504,10 @@ def main_menu(uid: int) -> dict:
     rows = [[USER_BTN["top"], USER_BTN["pop"]], [USER_BTN["all"], USER_BTN["fav"]]]
     if uid in ADMINS:
         rows.append([B_ADMIN])
-    return rkb(rows)
+    m = rkb(rows)
+    if WEBAPP_URL:
+        m["keyboard"].append([{"text": "🌸 Anime sayt", "web_app": {"url": WEBAPP_URL}}])
+    return m
 
 
 MENU_TEXT = ("🎌 <b>Anime bot</b>\n\nAnime <b>kodini</b> yuboring (masalan: <code>12</code>) yoki "
@@ -1603,15 +1610,89 @@ async def backup_loop() -> None:
         await backup_db()
 
 
+# ---------- Mini App (sayt) ----------
+poster_cache: dict[int, bytes] = {}
+
+
+def check_init(data: str) -> dict | None:
+    """Telegram WebApp initData imzosini tekshiradi, foydalanuvchini qaytaradi."""
+    try:
+        pairs = dict(parse_qsl(data, keep_blank_values=True))
+        got = pairs.pop("hash", "")
+        chk = "\n".join(f"{k}={v}" for k, v in sorted(pairs.items()))
+        secret = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+        if not hmac.compare_digest(hmac.new(secret, chk.encode(), hashlib.sha256).hexdigest(), got):
+            return None
+        if time.time() - int(pairs.get("auth_date", "0")) > 7 * 86400:
+            return None
+        return json.loads(pairs["user"])
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def api_data(uid: int) -> dict:
+    rows = db.execute(
+        "SELECT a.id, a.title, a.descr, a.genre, (a.poster IS NOT NULL AND a.poster<>'') hp, "
+        "(SELECT COUNT(*) FROM views v WHERE v.anime_id=a.id) views, "
+        "(SELECT COUNT(*) FROM episodes e WHERE e.anime_id=a.id) eps, "
+        "(SELECT AVG(score) FROM ratings r WHERE r.anime_id=a.id) rt, "
+        "(SELECT COUNT(*) FROM ratings r WHERE r.anime_id=a.id) rn, "
+        "(SELECT score FROM ratings r WHERE r.anime_id=a.id AND r.user_id=?) my, "
+        "(SELECT 1 FROM favorites f WHERE f.anime_id=a.id AND f.user_id=?) fav "
+        "FROM anime a ORDER BY a.id DESC LIMIT 500", (uid, uid)).fetchall()
+    items = []
+    for r in rows:
+        d = dict(r)
+        d["descr"] = (d["descr"] or "")[:600]
+        d["hp"], d["fav"] = bool(d["hp"]), 1 if d["fav"] else 0
+        items.append(d)
+    return {"bot": BOT_USERNAME, "animes": items}
+
+
+async def poster_bytes(aid: int) -> bytes | None:
+    if aid in poster_cache:
+        return poster_cache[aid]
+    r = db.execute("SELECT poster FROM anime WHERE id=?", (aid,)).fetchone()
+    if not r or not r["poster"]:
+        return None
+    f = await tg("getFile", file_id=r["poster"])
+    resp = await http.get(f"{TG_HOST}/file/bot{BOT_TOKEN}/{f['file_path']}", timeout=30)
+    if resp.status_code != 200:
+        return None
+    if len(poster_cache) > 300:
+        poster_cache.clear()
+    poster_cache[aid] = resp.content
+    return resp.content
+
+
+def api_post(uid: int, path: str, body: dict) -> dict:
+    aid = int(body.get("id", 0))
+    if not db.execute("SELECT 1 FROM anime WHERE id=?", (aid,)).fetchone():
+        return {"ok": False}
+    if path == "/api/fav":
+        if db.execute("SELECT 1 FROM favorites WHERE user_id=? AND anime_id=?", (uid, aid)).fetchone():
+            db.execute("DELETE FROM favorites WHERE user_id=? AND anime_id=?", (uid, aid))
+        else:
+            db.execute("INSERT OR IGNORE INTO favorites(user_id,anime_id) VALUES(?,?)", (uid, aid))
+    else:
+        score = int(body.get("score", 0))
+        if not 1 <= score <= 5:
+            return {"ok": False}
+        db.execute("INSERT OR REPLACE INTO ratings(user_id,anime_id,score) VALUES(?,?,?)", (uid, aid, score))
+    db.commit()
+    return {"ok": True}
+
+
 # ---------- webhook server ----------
 async def web_conn(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
-    status, body, method = 404, b"not found", ""
+    status, body, ctype, method, extra = 404, b"not found", "text/plain", "", ""
     try:
         line = await asyncio.wait_for(reader.readline(), 15)
         parts = line.decode("latin1").split()
         if len(parts) < 2:
             return
-        method, path = parts[0], parts[1].split("?")[0]
+        method, full = parts[0], parts[1]
+        path = full.split("?")[0]
         headers: dict[str, str] = {}
         while True:
             h = await asyncio.wait_for(reader.readline(), 15)
@@ -1619,27 +1700,52 @@ async def web_conn(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -
                 break
             k, _, v = h.decode("latin1").partition(":")
             headers[k.strip().lower()] = v.strip()
-        if method in ("GET", "HEAD") and path in ("/", "/health", "/healthz"):
-            status, body = 200, b"ok"
-        elif method == "POST" and path == WEBHOOK_PATH:
-            n = int(headers.get("content-length", "0") or 0)
-            if headers.get("x-telegram-bot-api-secret-token") != WEBHOOK_SECRET:
-                status, body = 403, b"forbidden"
-            elif n <= 0 or n > 2_000_000:
-                status, body = 400, b"bad request"
-            else:
-                u = json.loads(await asyncio.wait_for(reader.readexactly(n), 15))
-                t = asyncio.create_task(handle_safe(u))
-                tasks.add(t)
-                t.add_done_callback(tasks.discard)
+        n = int(headers.get("content-length", "0") or 0)
+        raw = b""
+        if n > 2_000_000:
+            status, body = 400, b"bad request"
+        else:
+            if n > 0:
+                raw = await asyncio.wait_for(reader.readexactly(n), 15)
+            if method in ("GET", "HEAD") and path in ("/", "/health", "/healthz"):
                 status, body = 200, b"ok"
+            elif method in ("GET", "HEAD") and path in ("/app", "/app/"):
+                with open(WEBAPP_FILE, "rb") as f:
+                    status, body, ctype, extra = 200, f.read(), "text/html; charset=utf-8", "Cache-Control: no-cache\r\n"
+            elif method in ("GET", "HEAD") and path.startswith("/poster/") and path[8:].isdigit():
+                img = await poster_bytes(int(path[8:]))
+                if img:
+                    status, body, ctype, extra = 200, img, "image/jpeg", "Cache-Control: public, max-age=86400\r\n"
+            elif method == "POST" and path == WEBHOOK_PATH:
+                if headers.get("x-telegram-bot-api-secret-token") != WEBHOOK_SECRET:
+                    status, body = 403, b"forbidden"
+                elif n <= 0:
+                    status, body = 400, b"bad request"
+                else:
+                    t = asyncio.create_task(handle_safe(json.loads(raw)))
+                    tasks.add(t)
+                    t.add_done_callback(tasks.discard)
+                    status, body = 200, b"ok"
+            elif path.startswith("/api/"):
+                user = check_init(headers.get("x-init-data", ""))
+                if not user:
+                    status, body = 401, b"unauthorized"
+                else:
+                    ctype = "application/json"
+                    if method == "GET" and path == "/api/data":
+                        reg_user(user)
+                        out = api_data(user["id"])
+                        out["user"] = {k: user.get(k) for k in ("id", "first_name", "username")}
+                        status, body = 200, json.dumps(out, ensure_ascii=False).encode()
+                    elif method == "POST" and path in ("/api/fav", "/api/rate"):
+                        status, body = 200, json.dumps(api_post(user["id"], path, json.loads(raw or b"{}"))).encode()
     except Exception as e:  # noqa: BLE001
         log.error("web: %r", e)
-        status, body = 400, b"error"
+        status, body, ctype = 400, b"error", "text/plain"
     finally:
         try:
-            reason = {200: "OK", 400: "Bad Request", 403: "Forbidden", 404: "Not Found"}.get(status, "")
-            head = (f"HTTP/1.1 {status} {reason}\r\nContent-Type: text/plain\r\n"
+            reason = {200: "OK", 400: "Bad Request", 401: "Unauthorized", 403: "Forbidden", 404: "Not Found"}.get(status, "")
+            head = (f"HTTP/1.1 {status} {reason}\r\nContent-Type: {ctype}\r\n{extra}"
                     f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n")
             writer.write(head.encode() + (b"" if method == "HEAD" else body))
             await writer.drain()
@@ -1690,6 +1796,9 @@ async def main() -> None:
     BOT_ID, BOT_USERNAME = me["id"], me["username"]
     await safe("setMyCommands", commands=[{"command": "start", "description": "Boshlash"},
                                           {"command": "menu", "description": "Asosiy menyu"}])
+    if WEBAPP_URL:
+        await safe("setChatMenuButton", menu_button={"type": "web_app", "text": "🌸 Anime", "web_app": {"url": WEBAPP_URL}})
+        log.info("Mini App: %s", WEBAPP_URL)
     old = get_set("news_channel")  # eski versiyadagi yagona E'lon kanalini yangi ro'yxatga ko'chirish
     if old and not news_channels():
         title = old

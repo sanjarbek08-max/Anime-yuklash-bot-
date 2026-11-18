@@ -1,0 +1,147 @@
+<!doctype html>
+<html lang="uz"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Anime Sakura</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+:root{--bg1:#ffe3ee;--bg2:#dfe3ff;--card:#ffffffe6;--tx:#3a2a4a;--sub:#7a6a8a;--pk:#f06a9a;--pk2:#ff9fc0;--mt:#9db2e3;--mt2:#b9c6ee}
+body.night{--bg1:#16123a;--bg2:#2a2160;--card:#262057e6;--tx:#f1e9ff;--sub:#b3a6d6;--mt:#2d3170;--mt2:#3b3f87}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+body{margin:0;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;color:var(--tx);background:linear-gradient(180deg,var(--bg1),var(--bg2));min-height:100vh;transition:background .5s}
+#mt{position:fixed;left:0;right:0;bottom:0;height:34vh;z-index:0;pointer-events:none}
+#pc{position:fixed;inset:0;z-index:50;pointer-events:none}
+#app{position:relative;z-index:1;padding:14px 14px 110px;max-width:640px;margin:auto}
+.top{display:flex;justify-content:space-between;align-items:center}
+.logo{font-size:22px;font-weight:800}.logo small{color:var(--pk);font-size:11px;letter-spacing:2px;margin-left:6px}
+.ib{border:0;background:var(--card);border-radius:50%;width:38px;height:38px;font-size:18px;margin-left:6px;box-shadow:0 2px 8px #0002}
+.srch{width:100%;margin:12px 0;padding:13px 18px;border-radius:24px;border:0;background:var(--card);color:var(--tx);font-size:15px;outline:0;box-shadow:0 2px 10px #0001}
+h2{font-size:17px;margin:16px 2px 10px}h2 span{color:var(--pk);font-size:12px;margin-left:6px}
+.rw{overflow:hidden;margin:0 -14px;padding:4px 0}
+.rail{display:flex;gap:12px;width:max-content;animation:sl linear infinite;padding-left:14px}
+.rail:active{animation-play-state:paused}
+@keyframes sl{to{transform:translateX(-50%)}}
+.c{background:var(--card);border-radius:20px;overflow:hidden;box-shadow:0 4px 14px #0002;position:relative}
+.rail .c{width:130px;flex:none}
+.p{aspect-ratio:2/3;background:linear-gradient(160deg,var(--pk2),#9fb4ff);display:flex;align-items:center;justify-content:center;font-size:56px;font-weight:800;color:#fff;position:relative}
+.p img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover}
+.ci{padding:8px 10px 10px}.ci b{display:block;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ci i{font-style:normal;font-size:12px;color:var(--sub)}
+.g{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.hb{position:absolute;top:8px;right:8px;width:34px;height:34px;border-radius:50%;border:0;background:#fffe;font-size:16px;z-index:2}
+.list .r{display:flex;gap:12px;align-items:center;background:var(--card);border-radius:16px;padding:8px;margin-bottom:10px}
+.list .r .p{width:54px;aspect-ratio:2/3;font-size:24px;border-radius:12px;overflow:hidden;flex:none}
+.rk{font-weight:800;color:var(--pk);width:22px;text-align:center}
+.nav{position:fixed;left:14px;right:14px;bottom:calc(12px + env(safe-area-inset-bottom,0px));z-index:5;max-width:612px;margin:auto;background:var(--card);border-radius:28px;display:flex;padding:6px;box-shadow:0 6px 24px #0003;backdrop-filter:blur(8px)}
+.nav button{flex:1;border:0;background:none;color:var(--sub);padding:8px 0;border-radius:22px;font-size:11px;font-weight:600}
+.nav button b{display:block;font-size:20px}.nav button.on{background:linear-gradient(135deg,var(--pk),var(--pk2));color:#fff}
+.sh{position:fixed;inset:0;z-index:20;background:#0007;display:none}.sh.on{display:flex;align-items:flex-end}
+.sb{background:var(--card);backdrop-filter:blur(14px);width:100%;max-width:640px;margin:auto;border-radius:28px 28px 0 0;padding:18px 18px 28px;max-height:88vh;overflow:auto;animation:up .3s}
+body.night .sb{background:#262057}body:not(.night) .sb{background:#fff}
+@keyframes up{from{transform:translateY(100%)}}
+.sr{display:flex;gap:14px}.sr .p{width:110px;flex:none;border-radius:18px;overflow:hidden;font-size:42px}
+.sr h3{margin:0 0 8px;font-size:20px}
+.ch{display:inline-block;background:#f06a9a22;border-radius:14px;padding:5px 10px;font-size:12px;margin:0 6px 6px 0}
+.ds{color:var(--sub);font-size:14px;line-height:1.5;margin:12px 0}
+.ar{display:flex;gap:10px;margin:12px 0}
+.bt{flex:1;border:0;border-radius:24px;padding:14px;font-size:15px;font-weight:700;color:#fff;background:linear-gradient(135deg,var(--pk),var(--pk2));box-shadow:0 4px 14px #f06a9a66}
+.st{text-align:center;font-size:34px}.st span{opacity:.3;cursor:pointer}.st span.on{opacity:1;color:#ffb400}
+.pf{background:var(--card);border-radius:20px;padding:16px;margin-bottom:12px}
+.tg{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-top:1px solid #8883}
+.tg input{width:44px;height:24px}
+.em{text-align:center;color:var(--sub);padding:40px 0}
+</style></head><body>
+<svg id="mt" viewBox="0 0 400 200" preserveAspectRatio="none"><path d="M0 200V120L60 70l50 50 50-60 70 80 60-70 60 60 50-40v90z" fill="var(--mt2)"/><path d="M0 200V150l70-50 60 40 70-60 80 70 60-40 60 50v40z" fill="var(--mt)"/></svg>
+<canvas id="pc"></canvas>
+<div id="app">
+ <div class="top"><div class="logo">Anime<small>桜 SAKURA</small></div><div><button class="ib" id="bm">🎵</button><button class="ib" id="bn">🌙</button></div></div>
+ <div id="v"></div>
+</div>
+<div class="nav" id="nav"></div>
+<div class="sh" id="sh"><div class="sb" id="sb"></div></div>
+<script>
+const tg=window.Telegram&&Telegram.WebApp;if(tg){tg.ready();tg.expand()}
+const $=s=>document.querySelector(s),esc=s=>String(s??"").replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+let D={animes:[],bot:"",user:{}},tab="home",q="";
+const ST={get(k,d){try{return JSON.parse(localStorage.getItem(k))??d}catch(e){return d}},set(k,v){try{localStorage.setItem(k,JSON.stringify(v))}catch(e){}}};
+let night=ST.get("night",false),petals=ST.get("petals",true),music=false;
+async function api(p,b){const r=await fetch(p,{method:b?"POST":"GET",headers:{"X-Init-Data":tg?tg.initData:"","Content-Type":"application/json"},body:b?JSON.stringify(b):undefined});if(!r.ok)throw 0;return r.json()}
+// ---------- ovoz ----------
+let ac,mg;
+function A(){if(!ac){ac=new(window.AudioContext||window.webkitAudioContext)();mg=ac.createGain();mg.gain.value=.5;const d=ac.createDelay(1),f=ac.createGain(),lp=ac.createBiquadFilter();d.delayTime.value=.38;f.gain.value=.4;lp.type="lowpass";lp.frequency.value=2200;mg.connect(ac.destination);mg.connect(d);d.connect(lp);lp.connect(f);f.connect(d);lp.connect(ac.destination)}if(ac.state=="suspended")ac.resume();return ac}
+function tone(f,t,d,v,ty){const c=A(),o=c.createOscillator(),g=c.createGain();o.type=ty||"sine";o.frequency.value=f;g.gain.setValueAtTime(0,t);g.gain.linearRampToValueAtTime(v,t+.04);g.gain.exponentialRampToValueAtTime(.0001,t+d);o.connect(g);g.connect(mg);o.start(t);o.stop(t+d+.05)}
+function pop(){const t=A().currentTime;tone(1318,t,.5,.12);tone(1760,t+.07,.6,.09);tone(2093,t+.14,.7,.06)}
+const SC=[261.6,293.7,329.6,392,440,523.3,587.3,659.3],CH=[[130.8,196,261.6,329.6],[110,164.8,220,329.6],[174.6,261.6,349.2,440],[98,196,293.7,392]];
+let mi=0,mt;
+function mus(){const t=A().currentTime;if(mi%8==0){CH[(mi/8)%4].forEach((f,i)=>tone(f,t+i*.1,4,.05,"triangle"))}
+ if(Math.random()<.7)tone(SC[Math.floor(Math.random()*SC.length)],t,2.2,.07);mi++}
+function setMusic(on){music=on;$("#bm").textContent=on?"🔊":"🎵";clearInterval(mt);if(on){A();mus();mt=setInterval(mus,900)}}
+// ---------- gul barglari ----------
+const cv=$("#pc"),cx=cv.getContext("2d");let P=[],W,H;
+function rs(){W=cv.width=innerWidth;H=cv.height=innerHeight}rs();addEventListener("resize",rs);
+const amb=()=>({x:Math.random()*W,y:-20,vx:.3+Math.random()*.6,vy:.5+Math.random()*.8,s:5+Math.random()*6,r:Math.random()*6,vr:(Math.random()-.5)*.05,a:.7,amb:1});
+function burst(x,y){for(let i=0;i<16;i++){const an=Math.random()*6.28,sp=2+Math.random()*4;P.push({x,y,vx:Math.cos(an)*sp,vy:Math.sin(an)*sp-2,s:6+Math.random()*7,r:Math.random()*6,vr:(Math.random()-.5)*.2,a:1,g:.12})}}
+for(let i=0;i<14;i++){const p=amb();p.y=Math.random()*H;P.push(p)}
+function loop(){cx.clearRect(0,0,W,H);for(let i=P.length-1;i>=0;i--){const p=P[i];p.x+=p.vx;p.y+=p.vy;p.vy+=p.g||0;if(p.g){p.vx*=.98;p.a-=.012}p.r+=p.vr;
+ if(p.a<=0||p.y>H+30||p.x>W+30){if(p.amb){if(petals)Object.assign(p,amb());else P.splice(i,1)}else P.splice(i,1);continue}
+ if(p.amb&&!petals)continue;cx.save();cx.translate(p.x,p.y);cx.rotate(p.r);cx.globalAlpha=p.a;cx.fillStyle="#ffb7d0";cx.beginPath();cx.ellipse(0,0,p.s,p.s*.6,0,0,6.28);cx.fill();cx.restore()}
+ if(petals&&P.filter(p=>p.amb).length<14)P.push(amb());requestAnimationFrame(loop)}loop();
+document.addEventListener("click",e=>{if(e.target.closest("button,.c,.r,.sh .st span")){burst(e.clientX,e.clientY);try{pop()}catch(x){}}},true);
+// ---------- UI ----------
+const stars=a=>a.rt?`⭐ ${a.rt.toFixed(1)}`:"⭐ —";
+const poster=a=>`<div class="p">${esc((a.title||"?")[0].toUpperCase())}${a.hp?`<img loading="lazy" src="/poster/${a.id}" onerror="this.remove()">`:""}</div>`;
+const card=(a,hb)=>`<div class="c" data-id="${a.id}">${hb?`<button class="hb" data-f="${a.id}">${a.fav?"❤️":"🤍"}</button>`:""}${poster(a)}<div class="ci"><b>${esc(a.title)}</b><i>👁 ${a.views} ${stars(a)} 📺 ${a.eps}</i></div></div>`;
+function render(){
+ document.body.classList.toggle("night",night);$("#bn").textContent=night?"☀️":"🌙";
+ $("#nav").innerHTML=[["home","🏠","Bosh"],["top","🏆","Reyting"],["fav","💾","Saqlangan"],["me","👤","Profil"]].map(t=>`<button data-t="${t[0]}" class="${tab==t[0]?"on":""}"><b>${t[1]}</b>${t[2]}</button>`).join("");
+ const L=D.animes,v=$("#v");
+ if(tab=="home"){
+  const f=L.filter(a=>!q||(a.title+" "+(a.genre||"")+" "+a.id).toLowerCase().includes(q.toLowerCase()));
+  let top=[...L].sort((a,b)=>b.views-a.views).slice(0,10),r=top;while(r.length&&r.length<6)r=r.concat(top);
+  v.innerHTML=`<input class="srch" id="q" placeholder="Anime nomi, janri yoki kodi..." value="${esc(q)}">`+
+   (!q&&top.length?`<h2>🔥 Eng ko'p ko'rilgan<span>人気</span></h2><div class="rw"><div class="rail" style="animation-duration:${r.length*4}s">${r.concat(r).map(a=>card(a)).join("")}</div></div>`:"")+
+   `<h2>🎬 Animelar<span>アニメ</span></h2>`+(f.length?`<div class="g">${f.map(a=>card(a,1)).join("")}</div>`:`<div class="em">Hech narsa topilmadi</div>`);
+  const qi=$("#q");qi.oninput=()=>{q=qi.value;const p=qi.selectionStart;render();const n=$("#q");n.focus();n.setSelectionRange(p,p)};
+ }else if(tab=="top"){
+  const s=[...L].filter(a=>a.rt).sort((a,b)=>b.rt-a.rt||b.rn-a.rn);
+  v.innerHTML=`<h2>🏆 Reyting<span>ランキング</span></h2><div class="list">`+(s.length?s.map((a,i)=>`<div class="r c" data-id="${a.id}"><div class="rk">${i+1}</div>${poster(a)}<div class="ci"><b>${esc(a.title)}</b><i>${stars(a)} (${a.rn}) · 👁 ${a.views}</i></div></div>`).join(""):`<div class="em">Hali baholangan anime yo'q</div>`)+`</div>`;
+ }else if(tab=="fav"){
+  const s=L.filter(a=>a.fav);
+  v.innerHTML=`<h2>💾 Saqlanganlar<span>保存</span></h2>`+(s.length?`<div class="g">${s.map(a=>card(a,1)).join("")}</div>`:`<div class="em">Hali hech narsa saqlanmagan.<br>Animeda 🤍 ni bosing</div>`);
+ }else{
+  const u=D.user||{};
+  v.innerHTML=`<h2>👤 Profil<span>プロフィール</span></h2><div class="pf"><b style="font-size:18px">${esc(u.first_name||"Mehmon")}</b><div class="ds">${u.username?"@"+esc(u.username)+" · ":""}Saqlangan: ${L.filter(a=>a.fav).length} · Baholagan: ${L.filter(a=>a.my).length}</div>
+  <div class="tg">🌙 Tungi rejim<input type="checkbox" id="tn" ${night?"checked":""}></div>
+  <div class="tg">🎵 Sokin musiqa<input type="checkbox" id="tm" ${music?"checked":""}></div>
+  <div class="tg">🌸 Gul barglari<input type="checkbox" id="tp" ${petals?"checked":""}></div></div>
+  <button class="bt" style="width:100%" id="bo">🤖 Botga qaytish</button>`;
+  $("#tn").onchange=e=>{night=e.target.checked;ST.set("night",night);render()};
+  $("#tm").onchange=e=>setMusic(e.target.checked);
+  $("#tp").onchange=e=>{petals=e.target.checked;ST.set("petals",petals)};
+  $("#bo").onclick=()=>tg?tg.close():0;
+ }
+}
+function sheet(id){
+ const a=D.animes.find(x=>x.id==id);if(!a)return;
+ $("#sb").innerHTML=`<div class="sr">${poster(a)}<div><h3>${esc(a.title)}</h3><span class="ch">🔢 Kod: ${a.id}</span>${a.genre?`<span class="ch">🎭 ${esc(a.genre)}</span>`:""}<span class="ch">📺 ${a.eps} qism</span><span class="ch">👁 ${a.views}</span><span class="ch">${a.rt?`⭐ ${a.rt.toFixed(1)} (${a.rn})`:"⭐ baholanmagan"}</span></div></div>
+ ${a.descr?`<div class="ds">${esc(a.descr)}</div>`:""}
+ <div class="ar"><button class="bt" id="bw">▶️ Botda ko'rish</button><button class="ib" id="bf" style="width:50px;height:50px">${a.fav?"❤️":"🤍"}</button><button class="ib" id="bs" style="width:50px;height:50px">📤</button></div>
+ <div class="st" id="st">${[1,2,3,4,5].map(i=>`<span data-s="${i}" class="${(a.my||0)>=i?"on":""}">★</span>`).join("")}</div><div class="ds" style="text-align:center">Baholash uchun yulduzni bosing</div>`;
+ $("#sh").classList.add("on");
+ const link=`https://t.me/${D.bot}?start=a${a.id}`;
+ $("#bw").onclick=()=>{tg?tg.openTelegramLink(link):open(link)};
+ $("#bf").onclick=()=>fav(a.id);
+ $("#bs").onclick=()=>{const u="https://t.me/share/url?url="+encodeURIComponent(link)+"&text="+encodeURIComponent("🎬 "+a.title);tg?tg.openTelegramLink(u):open(u)};
+ $("#st").onclick=async e=>{const s=+e.target.dataset.s;if(!s)return;try{await api("/api/rate",{id:a.id,score:s});await load();sheet(a.id)}catch(x){}};
+}
+async function fav(id){const a=D.animes.find(x=>x.id==id);a.fav=a.fav?0:1;render();if($("#sh").classList.contains("on"))sheet(id);try{await api("/api/fav",{id})}catch(e){a.fav=a.fav?0:1;render()}}
+document.addEventListener("click",e=>{
+ const t=e.target.closest("[data-t]");if(t){tab=t.dataset.t;render();scrollTo(0,0);return}
+ const f=e.target.closest("[data-f]");if(f){e.stopPropagation();fav(+f.dataset.f);return}
+ const c=e.target.closest(".c[data-id]");if(c){sheet(c.dataset.id);return}
+ if(e.target.id=="sh")$("#sh").classList.remove("on");
+});
+$("#bn").onclick=()=>{night=!night;ST.set("night",night);render()};
+$("#bm").onclick=()=>setMusic(!music);
+async function load(){D=await api("/api/data");render()}
+load().catch(()=>{$("#v").innerHTML='<div class="em">Saytni Telegram ichidagi bot tugmasi orqali oching 🌸</div>'});
+</script></body></html>
