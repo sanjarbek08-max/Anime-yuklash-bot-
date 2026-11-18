@@ -1196,7 +1196,21 @@ async def cm_state(uid: int, msg: dict, st: dict) -> bool:
                 await send(uid, "❌ Bu xabar tanlangan chatdan emas.", back)
                 return True
             if act == "del":
-                await tg("deleteMessage", chat_id=cid, message_id=mid_)
+                done = st.setdefault("done", set())
+                if mid_ in done:
+                    await send(uid, f"ℹ️ Bu xabar (ID <code>{mid_}</code>) allaqachon o'chirilgan.", back)
+                    return True
+                try:
+                    await tg("deleteMessage", chat_id=cid, message_id=mid_)
+                except TGError as e:
+                    if "not found" in str(e).lower():
+                        await send(uid, f"❌ Xabar topilmadi.\n\nChat: <code>{cid}</code>\nXabar ID: <code>{mid_}</code>\n\n"
+                                        "Sabab: u allaqachon o'chirilgan, yoki forward qilingan nusxa boshqa joydan. "
+                                        "Kanaldagi asl xabarning <b>havolasini</b> yuborib ko'ring "
+                                        "(xabarni bosib «Havolani nusxalash»).", back)
+                        return True
+                    raise
+                done.add(mid_)
                 ok = "🗑 Xabar o'chirildi."
             elif act == "pin":
                 await tg("pinChatMessage", chat_id=cid, message_id=mid_, disable_notification=True)
