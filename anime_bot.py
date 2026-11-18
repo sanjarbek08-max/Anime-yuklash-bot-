@@ -969,7 +969,7 @@ CM_PROMPT = {
     "desc": "📝 Yangi <b>tavsifni</b> yozing (o'chirish uchun <code>-</code>):",
     "post": "📣 Yubormoqchi bo'lgan xabaringizni yuboring (matn, rasm, video, fayl — hammasi bo'ladi).",
     "photo": "🖼 Yangi <b>rasmni</b> yuboring (rasm qilib).",
-    "mute": "🔇 <b>Jim qilish (24 soat)</b>\n\nFoydalanuvchi ID raqamini yuboring (yoki @username / forward).",
+    "mute": "🔇 <b>Jim qilish</b>\n\nFoydalanuvchi ID raqamini yuboring (yoki @username / forward).",
     "unmute": "🔊 <b>Yozishga ruxsat berish</b>\n\nFoydalanuvchi ID raqamini yuboring.",
 }
 
@@ -992,7 +992,8 @@ def cm_need(act: str, ctype: str) -> str:
     return {"del": "can_delete_messages", "ban": "can_restrict_members", "unban": "can_restrict_members",
             "pin": pin, "unpin": pin, "title": "can_change_info", "desc": "can_change_info",
             "link": "can_invite_users", "photo": "can_change_info", "delphoto": "can_change_info",
-            "unpinall": pin, "unpinallok": pin, "mute": "can_restrict_members", "unmute": "can_restrict_members", "post": "can_post_messages" if ctype == "channel" else ""}.get(act, "")
+            "unpinall": pin, "unpinallok": pin, "mute": "can_restrict_members", "mutetime": "can_restrict_members",
+            "unmute": "can_restrict_members", "post": "can_post_messages" if ctype == "channel" else ""}.get(act, "")
 
 
 def cm_save(ch: dict) -> None:
@@ -1114,7 +1115,7 @@ async def cm_detail(uid: int, mid: int | None, cid: int) -> None:
     if cm_has(m, "can_restrict_members"):
         acts += [A("🚫 Bloklash", "ban"), A("♻️ Blokdan chiqarish", "unban")]
         if k == "g":
-            acts += [A("🔇 Jim qilish (24 s)", "mute"), A("🔊 Ruxsat berish", "unmute")]
+            acts += [A("🔇 Jim qilish", "mute"), A("🔊 Ruxsat berish", "unmute")]
     if cm_has(m, "can_edit_messages" if k == "c" else "can_pin_messages"):
         acts += [A("📌 Qadash", "pin"), A("📍 Qadashni olib tashlash", "unpin"), A("📍 Hammasini olib tashlash", "unpinall")]
     if cm_has(m, "can_change_info"):
@@ -1168,6 +1169,42 @@ async def cm_action(uid: int, mid: int | None, act: str, cid: int) -> None:
             await show(uid, mid, CM_PROMPT[act], back)
     except TGError as e:
         await show(uid, mid, f"❌ Telegram xatosi: <code>{esc(str(e))}</code>", back)
+
+
+def parse_dur(text: str) -> int | None:
+    """'15', '30 min', '2 soat', '1 kun', '1:30', 'cheksiz' -> soniya (0 = cheksiz, None = noto'g'ri)."""
+    t = text.strip().lower()
+    if t in ("cheksiz", "abadiy", "forever"):
+        return 0
+    m = re.fullmatch(r"(\d+):(\d{1,2})", t)
+    if m:
+        return int(m.group(1)) * 3600 + int(m.group(2)) * 60 or None
+    m = re.fullmatch(r"(\d+)\s*([a-z']*)", t)
+    if not m or int(m.group(1)) == 0:
+        return None
+    u = m.group(2)
+    mult = (60 if u in ("", "m", "min", "minut", "daq", "daqiqa") else 3600 if u in ("h", "soat", "hour")
+            else 86400 if u in ("d", "kun", "day") else 604800 if u in ("w", "hafta") else 0)
+    return int(m.group(1)) * mult or None
+
+
+def fmt_dur(sec: int) -> str:
+    if not sec:
+        return "cheksiz"
+    if sec < 3600:
+        return f"{sec // 60} daqiqa"
+    if sec < 86400:
+        h, mnt = divmod(sec // 60, 60)
+        return f"{h} soat" + (f" {mnt} daqiqa" if mnt else "")
+    d, rest = divmod(sec, 86400)
+    return f"{d} kun" + (f" {rest // 3600} soat" if rest // 3600 else "")
+
+
+async def cm_mute(cid: int, t: int, sec: int) -> None:
+    p = {"chat_id": cid, "user_id": t, "permissions": {"can_send_messages": False}}
+    if sec:
+        p["until_date"] = int(time.time()) + sec
+    await tg("restrictChatMember", **p)
 
 
 async def cm_state(uid: int, msg: dict, st: dict) -> bool:
@@ -1247,22 +1284,39 @@ async def cm_state(uid: int, msg: dict, st: dict) -> bool:
             if t in ADMINS or t == BOT_ID:
                 await send(uid, "⛔ Adminni yoki botni bloklab bo'lmaydi.", back)
                 return True
+            if act == "mute":
+                st["act"], st["t"] = "mutetime", t
+                durs = [("5 daq", 300), ("15 daq", 900), ("30 daq", 1800), ("1 soat", 3600), ("6 soat", 21600),
+                        ("1 kun", 86400)]
+                rows = [[btn(n, f"ad:cmm:{cid}:{t}:{x}") for n, x in durs[i:i + 3]] for i in (0, 3)]
+                rows += [[btn("♾ Cheksiz", f"ad:cmm:{cid}:{t}:0")], [btn("🔙 Orqaga", f"ad:cmc:{cid}")]]
+                await send(uid, f"🔇 <code>{t}</code> necha vaqtga jim qilinsin?\n\nTugmani bosing yoki yozing: "
+                                "<code>15</code> (daqiqa), <code>30 min</code>, <code>2 soat</code>, "
+                                "<code>1 kun</code>, <code>1:30</code> (1 soat 30 daq) yoki <code>cheksiz</code>.", kb(rows))
+                return True
             if act == "ban":
                 await tg("banChatMember", chat_id=cid, user_id=t)
                 dn = "bloklandi"
             elif act == "unban":
                 await tg("unbanChatMember", chat_id=cid, user_id=t, only_if_banned=True)
                 dn = "blokdan chiqarildi"
-            elif act == "mute":
-                await tg("restrictChatMember", chat_id=cid, user_id=t, permissions={"can_send_messages": False},
-                         until_date=int(time.time()) + 86400)
-                dn = "24 soatga jim qilindi"
             else:
                 chx = await tg("getChat", chat_id=cid)
                 await tg("restrictChatMember", chat_id=cid, user_id=t,
                          permissions=chx.get("permissions") or {"can_send_messages": True})
                 dn = "yana yozishi mumkin"
             await send(uid, f"✅ <code>{t}</code> {dn}.\nYana ID yuborishingiz mumkin.", back)
+        elif act == "mutetime":
+            sec = parse_dur(text)
+            if sec is None or (sec and sec < 60):
+                await send(uid, "❌ Muddatni yozing: <code>15</code> (daqiqa), <code>30 min</code>, <code>2 soat</code>, "
+                                "<code>1 kun</code> yoki <code>cheksiz</code> (kamida 1 daqiqa).", back)
+                return True
+            t = st["t"]
+            await cm_mute(cid, t, sec)
+            st["act"] = "mute"
+            st.pop("t", None)
+            await send(uid, f"✅ <code>{t}</code> jim qilindi: <b>{fmt_dur(sec)}</b>.\nYana ID yuborishingiz mumkin.", back)
         elif act == "photo":
             ph = (msg.get("photo") or [None])[-1]
             doc = msg.get("document") or {}
@@ -1378,6 +1432,19 @@ async def on_admin_cb(uid: int, msg: dict, data: str) -> None:
 
     elif sub == "cmx":
         await cm_action(uid, mid, p[2], int(p[3]))
+
+    elif sub == "cmm":  # ad:cmm:<chat>:<user>:<soniya>
+        c_, t_, sec_ = int(p[2]), int(p[3]), int(p[4])
+        bk = kb([[btn("🔙 Orqaga", f"ad:cmc:{c_}")]])
+        mm = await cm_member(c_)
+        if not mm or not cm_has(mm, "can_restrict_members"):
+            await show(uid, mid, "❌ Botda bu amal uchun huquq yo'q.", bk)
+        else:
+            try:
+                await cm_mute(c_, t_, sec_)
+                await show(uid, mid, f"✅ <code>{t_}</code> jim qilindi: <b>{fmt_dur(sec_)}</b>.", bk)
+            except TGError as e:
+                await show(uid, mid, f"❌ Telegram xatosi: <code>{esc(str(e))}</code>", bk)
 
     elif sub == "add":
         state[uid] = {"s": "title", "d": {}}
