@@ -74,8 +74,16 @@ def restore_db_from_telegram() -> None:
         return
     try:
         with httpx.Client(timeout=60) as c:
-            chat = c.post(f"{API}/getChat", json={"chat_id": BACKUP_CHAT}).json()
-            doc = ((chat.get("result") or {}).get("pinned_message") or {}).get("document")
+            cid, doc = BACKUP_CHAT, None
+            for _ in range(3):
+                res = c.post(f"{API}/getChat", json={"chat_id": cid}).json().get("result") or {}
+                pm = res.get("pinned_message") or {}
+                txt = pm.get("text") or ""
+                if txt.startswith("↪️ BACKUP→"):
+                    cid = int(txt.split("→", 1)[1].strip())
+                    continue
+                doc = pm.get("document")
+                break
             if not doc or doc.get("file_name") != BACKUP_NAME:
                 logging.warning("Zaxira topilmadi - yangi baza yaratiladi")
                 return
@@ -501,7 +509,7 @@ ADMIN_BTN = {"ad:add": "➕ Anime qo'shish", "ad:pick:addep:0": "🎞 Qism qo'sh
              "ad:ch": "📢 Majburiy kanallar", "ad:news": "📣 E'lon kanallari",
              "ad:bc": "📨 Xabar yuborish", "ad:sl": "⏰ Rejalangan xabarlar", "ad:stat": "📊 Statistika",
              "ad:am": "👥 Adminlar", "ad:us": "👤 Foydalanuvchilar",
-             "ad:cm": "🛡 Kanal boshqaruvi", "ad:ap": "🤖 Avto-post"}
+             "ad:cm": "🛡 Kanal boshqaruvi", "ad:ap": "🤖 Avto-post", "ad:bk": "💾 Zaxira"}
 ADMIN_BTN_REV = {v: k for k, v in ADMIN_BTN.items()}
 ADMIN_BTN_REV["📣 E'lon kanali"] = "ad:news"  # eski yozuv (eski klaviatura uchun)
 ALL_BTN_TEXTS = set(USER_BTN.values()) | set(ADMIN_BTN_REV) | {B_ADMIN, B_MENU}
@@ -537,7 +545,7 @@ def admin_kb(uid: int = 0) -> dict:
             [t["ad:ch"], t["ad:news"]], [t["ad:bc"], t["ad:sl"]], [t["ad:us"], t["ad:stat"]]]
     # "Adminlar" tugmasi faqat asosiy adminda bor
     if uid == MAIN_ADMIN:
-        rows += [[t["ad:am"], t["ad:cm"]], [t["ad:ap"], B_MENU]]
+        rows += [[t["ad:am"], t["ad:cm"]], [t["ad:ap"], t["ad:bk"]], [B_MENU]]
     else:
         rows.append([t["ad:ap"], B_MENU])
     return rkb(rows)
@@ -879,8 +887,21 @@ async def show_users(uid: int, mid: int | None, flt: str, page: int) -> None:
                          "Batafsil ko'rish uchun ustiga bosing.", kb(kbrows))
 
 
-async def show_user_card(uid: int, mid: int | None, tid: int, flt: str, page: int) -> None:
+async def recover_user(tid: int):
+    """Foydalanuvchi bazada yo'q bo'lsa (zaxira eskirgan), Telegram'dan so'rab qayta qo'shadi."""
     r = db.execute("SELECT * FROM users WHERE user_id=?", (tid,)).fetchone()
+    if r:
+        return r
+    try:
+        ch = await tg("getChat", chat_id=tid)
+    except Exception:  # noqa: BLE001
+        return None
+    reg_user({"id": tid, "first_name": ch.get("first_name") or "", "username": ch.get("username")})
+    return db.execute("SELECT * FROM users WHERE user_id=?", (tid,)).fetchone()
+
+
+async def show_user_card(uid: int, mid: int | None, tid: int, flt: str, page: int) -> None:
+    r = await recover_user(tid)
     back = kb([[btn("🔙 Ro'yxatga", f"ad:us:{flt}:{page}")]])
     if not r:
         await show(uid, mid, "Foydalanuvchi topilmadi.", back)
@@ -1379,7 +1400,43 @@ async def on_my_chat(mc: dict) -> None:
 # ---------- Avto-post: yuklangan animelarni e'lon kanallariga o'zi tashlab turadi ----------
 def ap_cfg() -> dict:
     return {"on": get_set("ap_on", "0") == "1", "idle": int(get_set("ap_idle", "30") or 30),
-            "perday": int(get_set("ap_perday", "5") or 5), "mode": get_set("ap_mode", "rand")}
+            "perday": int(get_set("ap_perday", "5") or 5), "mode": get_set("ap_mode", "rand"),
+            "from": int(get_set("ap_from", "0") or 0), "to": int(get_set("ap_to", "1440") or 1440)}
+
+
+def ap_in_window(c: dict) -> bool:
+    f, t = c["from"], c["to"]
+    if f == 0 and t >= 1440:
+        return True
+    n = now_local()
+    m = n.hour * 60 + n.minute
+    return f <= m < t if f < t else (m >= f or m < t)
+
+
+def fmt_hm(m: int) -> str:
+    m = min(m, 1440)
+    return f"{m // 60:02d}:{m % 60:02d}"
+
+
+def parse_window(text: str):
+    """'20-23', '20:30-02:00', '20' (20:00 dan kun oxirigacha), 'hamma' -> (boshlanish, tugash) daqiqada."""
+    t = text.strip().lower()
+    if t in ("hamma", "doim", "har doim", "24/7"):
+        return 0, 1440
+    m = re.fullmatch(r"(\d{1,2})(?::(\d{2}))?(?:\s*[-–—]\s*(\d{1,2})(?::(\d{2}))?)?", t)
+    if not m:
+        return None
+    h1, m1 = int(m.group(1)), int(m.group(2) or 0)
+    if h1 > 23 or m1 > 59:
+        return None
+    f = h1 * 60 + m1
+    if m.group(3) is None:
+        return f, 1440
+    h2, m2 = int(m.group(3)), int(m.group(4) or 0)
+    if h2 > 24 or m2 > 59 or (h2 == 24 and m2):
+        return None
+    to = h2 * 60 + m2 or 1440
+    return (f, to) if f != to else None
 
 
 def note_msg(msg: dict) -> None:
@@ -1437,7 +1494,7 @@ async def ap_post(cid: int, aid: int) -> None:
 
 async def ap_tick() -> None:
     c = ap_cfg()
-    if not c["on"]:
+    if not c["on"] or not ap_in_window(c):
         return
     now, day = time.time(), today()
     db.execute("DELETE FROM ap_log WHERE ts < ?", (now - 14 * 86400,))
@@ -1470,6 +1527,10 @@ async def autoposter() -> None:
         await asyncio.sleep(30)
 
 
+def ap_win_label(c: dict) -> str:
+    return "hamma vaqt" if c["from"] == 0 and c["to"] >= 1440 else f"{fmt_hm(c['from'])}–{fmt_hm(c['to'])}"
+
+
 def ap_text() -> str:
     c, day = ap_cfg(), today()
     st = "🟢 yoqilgan" if c["on"] else "🔴 o'chiq"
@@ -1478,6 +1539,7 @@ def ap_text() -> str:
              f"Holat: {st}",
              f"⏱ Pauza: <b>{c['idle']} daqiqa</b> (kanalda oxirgi xabardan keyin shuncha jim bo'lsa yuboradi)",
              f"📅 Kuniga: <b>{c['perday']} ta</b> (har bir kanalga)",
+             f"🕗 Ish vaqti: <b>{ap_win_label(c)}</b> (hozir {now_local():%H:%M}, " + ("ichida ✅" if ap_in_window(c) else "tashqarida ⏸") + ")",
              f"🔀 Tartib: <b>{'tasodifiy' if c['mode'] == 'rand' else 'ketma-ket'}</b>",
              f"🎬 Aylanadigan animelar: <b>{n_an}</b> ta (qismi borlari)", ""]
     chs = news_channels()
@@ -1493,6 +1555,7 @@ def ap_kb() -> dict:
     c = ap_cfg()
     return kb([[btn("🔴 O'chirish" if c["on"] else "🟢 Yoqish", "ad:apt")],
                [btn(f"⏱ Pauza: {c['idle']} daq", "ad:api"), btn(f"📅 Kuniga: {c['perday']}", "ad:apd")],
+               [btn(f"🕗 Ish vaqti: {ap_win_label(c)}", "ad:apw")],
                [btn("🔀 Tartib: tasodifiy" if c["mode"] == "rand" else "🔢 Tartib: ketma-ket", "ad:apm")],
                [btn("▶️ Hozir 1 ta yuborish", "ad:apn")], [btn("🔄 Aylanishni boshidan", "ad:apr")],
                [btn("🔙 Orqaga", "ad")]])
@@ -1500,7 +1563,15 @@ def ap_kb() -> dict:
 
 async def ap_state(uid: int, msg: dict, st: dict) -> bool:
     text = (msg.get("text") or "").strip()
-    if st["s"] == "apidle":
+    if st["s"] == "apwin":
+        w = parse_window(text)
+        if not w:
+            await send(uid, "❌ Masalan: <code>20-23</code>, <code>20:30-02:00</code>, <code>20</code> yoki <code>hamma</code>.",
+                       kb([[btn("❌ Bekor qilish", "ad:ap")]]))
+            return True
+        set_set("ap_from", str(w[0]))
+        set_set("ap_to", str(w[1]))
+    elif st["s"] == "apidle":
         sec = parse_dur(text)
         if not sec or sec < 60 or sec > 7 * 86400:
             await send(uid, "❌ Pauzani yozing: <code>30</code> (daqiqa), <code>45 min</code>, <code>2 soat</code> "
@@ -1578,6 +1649,13 @@ async def on_admin_cb(uid: int, msg: dict, data: str) -> None:
                "📅 Kuniga nechta anime yuborsin? (har bir kanalga, 1–100). Son yozing:")
         await show(uid, mid, ask, kb([[btn("❌ Bekor qilish", "ad:ap")]]))
 
+    elif sub == "apw":
+        state[uid] = {"s": "apwin"}
+        await show(uid, mid, "🕗 Avto-post qaysi <b>soat oralig'ida</b> ishlasin?\n\nMasalan: <code>20-23</code>, "
+                             "<code>20:30-02:00</code> (tungacha ham bo'ladi) yoki faqat <code>20</code> (20:00 dan kun oxirigacha). "
+                             "Doim ishlashi uchun: <code>hamma</code>.\n\nBot shu oraliqda kanaldagi oxirgi xabarni ko'radi va "
+                             "belgilangan pauzadan keyin yuboradi.", kb([[btn("❌ Bekor qilish", "ad:ap")]]))
+
     elif sub == "apn":
         res = []
         for ch in news_channels():
@@ -1596,6 +1674,22 @@ async def on_admin_cb(uid: int, msg: dict, data: str) -> None:
         db.execute("DELETE FROM ap_seen")
         db.commit()
         await show(uid, mid, "🔄 Aylanish boshidan boshlandi.\n\n" + ap_text(), ap_kb())
+
+    elif sub.startswith("bk") and uid != MAIN_ADMIN:
+        await send(uid, "⛔ Zaxira sozlamasi faqat asosiy adminga ochiq.")
+
+    elif sub == "bk":
+        await show(uid, mid, bk_text(), bk_kb())
+
+    elif sub == "bks":
+        err = await bk_switch(int(p[2]))
+        await show(uid, mid, (f"❌ {esc(err)}\n\n" if err else "✅ Zaxira joyi o'zgartirildi, birinchi nusxa yuborildi.\n\n")
+                   + bk_text(), bk_kb())
+
+    elif sub == "bkn":
+        ok = await backup_db(force=True)
+        await show(uid, mid, ("✅ Zaxira yuborildi.\n\n" if ok else f"❌ Yuborib bo'lmadi: {esc(_bk_err)}\n\n")
+                   + bk_text(), bk_kb())
 
     elif sub.startswith("cm") and uid != MAIN_ADMIN:
         await send(uid, "⛔ Kanal boshqaruvi faqat asosiy adminga ochiq.")
@@ -1834,9 +1928,9 @@ async def on_admin_cb(uid: int, msg: dict, data: str) -> None:
 
     elif sub == "wr":  # ad:wr:<user_id> — foydalanuvchiga xabar yozish
         tid = int(p[2])
-        r = db.execute("SELECT * FROM users WHERE user_id=?", (tid,)).fetchone()
+        r = await recover_user(tid)
         if not r:
-            await send(uid, "Foydalanuvchi topilmadi.")
+            await send(uid, "Foydalanuvchi topilmadi (u botni boshlamagan yoki o'chirib yuborgan bo'lishi mumkin).")
             return
         if r["blocked"]:
             await send(uid, "🚫 Bu foydalanuvchi botni bloklagan, xabar yuborib bo'lmaydi.")
@@ -1875,7 +1969,7 @@ async def admin_state(uid: int, msg: dict) -> bool:
     if s == "cm":
         return await cm_state(uid, msg, st)
 
-    if s in ("apidle", "apday"):
+    if s in ("apidle", "apday", "apwin"):
         return await ap_state(uid, msg, st)
 
     if s == "title":
@@ -2232,14 +2326,23 @@ async def handle_safe(u: dict) -> None:
 # ---------- zaxira nusxa ----------
 _bk_changes = -1
 _bk_msg = 0
+_bk_msg_chat = 0
+_bk_err = ""
 
 
-async def backup_db(force: bool = False) -> None:
-    global _bk_changes, _bk_msg
-    if not BACKUP_ON or not BACKUP_CHAT:
-        return
+def bk_chat() -> int:
+    """Zaxira yuboriladigan chat: adminlar tanlagan, bo'lmasa serverdagi BACKUP_CHAT."""
+    return int(get_set("backup_chat", "") or BACKUP_CHAT)
+
+
+async def backup_db(force: bool = False) -> bool:
+    global _bk_changes, _bk_msg, _bk_msg_chat, _bk_err
+    chat = bk_chat()
+    if not BACKUP_ON or not chat:
+        _bk_err = "zaxira o'chirilgan"
+        return False
     if db.total_changes == _bk_changes and not force:
-        return
+        return True
     try:
         db.commit()
         tmp = DB_PATH + ".bak"
@@ -2250,7 +2353,7 @@ async def backup_db(force: bool = False) -> None:
             data = f.read()
         r = await http.post(
             f"{API}/sendDocument",
-            data={"chat_id": BACKUP_CHAT, "caption": "💾 anime.db zaxira (o'chirmang)", "disable_notification": "true"},
+            data={"chat_id": chat, "caption": "💾 anime.db zaxira (o'chirmang)", "disable_notification": "true"},
             files={"document": (BACKUP_NAME, data)},
             timeout=120,
         )
@@ -2258,20 +2361,81 @@ async def backup_db(force: bool = False) -> None:
         if not res.get("ok"):
             raise RuntimeError(res.get("description"))
         mid = res["result"]["message_id"]
-        await tg("pinChatMessage", chat_id=BACKUP_CHAT, message_id=mid, disable_notification=True)
+        await tg("pinChatMessage", chat_id=chat, message_id=mid, disable_notification=True)
         if _bk_msg:
-            await safe("deleteMessage", chat_id=BACKUP_CHAT, message_id=_bk_msg)
-        _bk_msg = mid
+            await safe("deleteMessage", chat_id=_bk_msg_chat, message_id=_bk_msg)
+        _bk_msg, _bk_msg_chat = mid, chat
         _bk_changes = db.total_changes
         log.info("Zaxira yuborildi (%d bayt)", len(data))
+        return True
     except Exception as e:  # noqa: BLE001
+        _bk_err = str(e)[:120]
         log.error("zaxira xato: %r", e)
+        return False
+
+
+async def bk_switch(new: int) -> str | None:
+    """Zaxira joyini o'zgartiradi. Xato bo'lsa sababini qaytaradi."""
+    old = bk_chat()
+    if new == old:
+        return None
+    set_set("backup_chat", "" if new == BACKUP_CHAT else str(new))
+    if not await backup_db(force=True):
+        set_set("backup_chat", "" if old == BACKUP_CHAT else str(old))
+        return f"Zaxira yuborilmadi ({_bk_err}). Tanlangan admin botda /start bosganmi?"
+    # boshlang'ich chatda ko'rsatkich qoldiramiz: server qayta ishga tushganda zaxirani shu orqali topadi
+    ptr = int(get_set("bk_ptr", "0") or 0)
+    if ptr:
+        await safe("deleteMessage", chat_id=BACKUP_CHAT, message_id=ptr)
+        set_set("bk_ptr", "0")
+    if new != BACKUP_CHAT:
+        await safe("unpinAllChatMessages", chat_id=BACKUP_CHAT)
+        m = await safe("sendMessage", chat_id=BACKUP_CHAT, text=f"↪️ BACKUP→{new}", disable_notification=True)
+        if m:
+            await safe("pinChatMessage", chat_id=BACKUP_CHAT, message_id=m["message_id"], disable_notification=True)
+            set_set("bk_ptr", str(m["message_id"]))
+    return None
+
+
+def bk_name(i: int) -> str:
+    r = db.execute("SELECT first_name FROM users WHERE user_id=?", (i,)).fetchone()
+    return (r["first_name"] if r and r["first_name"] else str(i))
+
+
+def bk_text() -> str:
+    cur = bk_chat()
+    lines = ["💾 <b>Zaxira</b>", "", "Bot bazasi (foydalanuvchilar, animelar, qismlar) Telegram'ga nusxalanadi, "
+             "server yangilanganda shundan tiklanadi.", "", f"📍 Hozir: <b>{esc(bk_name(cur))}</b> <code>{cur}</code>",
+             f"⏱ Odatda har {BACKUP_EVERY // 60} daqiqada; foydalanuvchi, anime, qism yoki kanal qo'shilsa 30 soniyada.", "",
+             "Boshqa adminni tanlasangiz, zaxira unga tushadi (u botda /start bosgan bo'lishi kerak)."]
+    if not BACKUP_ON:
+        lines.append("\n⚠️ Zaxira hozir o'chiq (faqat Render/webhook rejimida yoqiladi).")
+    return "\n".join(lines)
+
+
+def bk_kb() -> dict:
+    cur = bk_chat()
+    rows = [[btn(("✅ " if a == cur else "👤 ") + bk_name(a) + (" (asosiy)" if a == MAIN_ADMIN else ""), f"ad:bks:{a}")]
+            for a in sorted(ADMINS, key=lambda x: (x != MAIN_ADMIN, x))]
+    rows += [[btn("📤 Hozir zaxira olish", "ad:bkn")], [btn("🔙 Orqaga", "ad")]]
+    return kb(rows)
+
+
+def bk_fingerprint() -> tuple:
+    return tuple(db.execute(
+        "SELECT (SELECT COUNT(*) FROM users), (SELECT COUNT(*) FROM users WHERE phone IS NOT NULL AND phone<>''), "
+        "(SELECT COUNT(*) FROM anime), (SELECT COUNT(*) FROM episodes), (SELECT COUNT(*) FROM channels), "
+        "(SELECT COUNT(*) FROM news_channels), (SELECT COUNT(*) FROM admins)").fetchone())
 
 
 async def backup_loop() -> None:
+    last, fp = time.time(), bk_fingerprint()
     while True:
-        await asyncio.sleep(BACKUP_EVERY)
-        await backup_db()
+        await asyncio.sleep(15)
+        now, cur = time.time(), bk_fingerprint()
+        if (cur != fp and now - last >= 30) or now - last >= BACKUP_EVERY:
+            await backup_db()
+            last, fp = now, cur
 
 
 # ---------- Mini App (sayt) ----------
