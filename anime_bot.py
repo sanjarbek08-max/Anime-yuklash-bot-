@@ -135,6 +135,11 @@ CREATE TABLE IF NOT EXISTS mychats(chat_id INTEGER PRIMARY KEY, title TEXT, type
 CREATE TABLE IF NOT EXISTS ap_log(chat_id INTEGER, anime_id INTEGER, ts REAL, day TEXT);
 CREATE TABLE IF NOT EXISTS ap_seen(chat_id INTEGER, anime_id INTEGER, PRIMARY KEY(chat_id, anime_id));
 CREATE TABLE IF NOT EXISTS ap_last(chat_id INTEGER PRIMARY KEY, ts REAL);
+CREATE TABLE IF NOT EXISTS ap_chan(chat_id INTEGER PRIMARY KEY, en INTEGER, idle INTEGER, perday INTEGER, wf INTEGER, wt INTEGER, days TEXT, mode TEXT);
+CREATE TABLE IF NOT EXISTS sub_need(user_id INTEGER, chat_id INTEGER, ts REAL, PRIMARY KEY(user_id, chat_id));
+CREATE TABLE IF NOT EXISTS sub_stat(user_id INTEGER, chat_id INTEGER, joined_at TEXT, left_at TEXT, chk REAL DEFAULT 0, PRIMARY KEY(user_id, chat_id));
+CREATE TABLE IF NOT EXISTS soc_links(id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT, url TEXT);
+CREATE TABLE IF NOT EXISTS soc_seen(user_id INTEGER PRIMARY KEY);
 CREATE TABLE IF NOT EXISTS sched(
     id INTEGER PRIMARY KEY AUTOINCREMENT, creator INTEGER, src_chat INTEGER, src_msg INTEGER,
     target TEXT, kind TEXT, hhmm TEXT, date TEXT, weekday INTEGER, next_run TEXT,
@@ -270,6 +275,113 @@ def channels() -> list:
     return db.execute("SELECT * FROM channels ORDER BY id").fetchall()
 
 
+# ---------- majburiy obuna statistikasi (faqat bot orqali qo'shilganlar) ----------
+def sub_joined(u: int, cid: int) -> None:
+    """Foydalanuvchi kanalga qo'shildi. Bot obuna bo'lishni so'ragan bo'lsa, «bot orqali» deb hisoblanadi."""
+    if db.execute("SELECT 1 FROM sub_stat WHERE user_id=? AND chat_id=?", (u, cid)).fetchone():
+        db.execute("UPDATE sub_stat SET left_at=NULL WHERE user_id=? AND chat_id=? AND left_at IS NOT NULL", (u, cid))
+    elif db.execute("SELECT 1 FROM sub_need WHERE user_id=? AND chat_id=?", (u, cid)).fetchone():
+        db.execute("INSERT INTO sub_stat(user_id, chat_id, joined_at, left_at) VALUES(?,?,?,NULL)", (u, cid, now_str()))
+    db.execute("DELETE FROM sub_need WHERE user_id=? AND chat_id=?", (u, cid))
+    db.commit()
+
+
+def sub_left(u: int, cid: int) -> None:
+    db.execute("UPDATE sub_stat SET left_at=? WHERE user_id=? AND chat_id=? AND left_at IS NULL", (now_str(), u, cid))
+    db.commit()
+
+
+async def on_chat_member(cm: dict) -> None:
+    cid = (cm.get("chat") or {}).get("id")
+    if not db.execute("SELECT 1 FROM channels WHERE chat_id=?", (cid,)).fetchone():
+        return
+    new = cm["new_chat_member"]
+    inside = new.get("status") in ("member", "administrator", "creator") or (
+        new.get("status") == "restricted" and new.get("is_member"))
+    (sub_joined if inside else sub_left)(new["user"]["id"], cid)
+
+
+_sub_audit_ts = 0.0
+
+
+async def sub_audit() -> None:
+    """Soatiga bir marta: qo'shilganlardan 100 tasini tekshirib, chiqib ketganlarini belgilaydi."""
+    global _sub_audit_ts
+    if time.time() - _sub_audit_ts < 3600:
+        return
+    _sub_audit_ts = time.time()
+    for ch in channels():
+        rows = db.execute("SELECT user_id FROM sub_stat WHERE chat_id=? AND left_at IS NULL ORDER BY chk LIMIT 100",
+                          (ch["chat_id"],)).fetchall()
+        for r in rows:
+            left = False
+            try:
+                m = await tg("getChatMember", chat_id=ch["chat_id"], user_id=r[0])
+                left = m.get("status") in ("left", "kicked") or (m.get("status") == "restricted" and not m.get("is_member"))
+            except Exception:  # noqa: BLE001
+                pass
+            db.execute("UPDATE sub_stat SET chk=?, left_at=CASE WHEN ? THEN ? ELSE left_at END WHERE user_id=? AND chat_id=?",
+                       (time.time(), 1 if left else 0, now_str(), r[0], ch["chat_id"]))
+            await asyncio.sleep(0.1)
+        db.commit()
+
+
+def sub_counts(cid: int) -> tuple:
+    j = db.execute("SELECT COUNT(*) FROM sub_stat WHERE chat_id=?", (cid,)).fetchone()[0]
+    l = db.execute("SELECT COUNT(*) FROM sub_stat WHERE chat_id=? AND left_at IS NOT NULL", (cid,)).fetchone()[0]
+    return j, l
+
+
+def sub_stats_text() -> str:
+    t = today()
+    wk = (now_local() - timedelta(days=6)).strftime("%Y-%m-%d")
+    q = lambda sql, *a: db.execute(sql, a).fetchone()[0]  # noqa: E731
+    lines = ["📊 <b>Obuna statistikasi</b>", "Faqat bot orqali (majburiy obuna tufayli) qo'shilganlar hisoblanadi.", ""]
+    tj = tl = 0
+    for c in channels():
+        cid = c["chat_id"]
+        j, l = sub_counts(cid)
+        tj, tl = tj + j, tl + l
+        lines += [f"📣 <b>{esc(c['title'])}</b>",
+                  f"➕ Qo'shilgan: <b>{j}</b> (bugun {q('SELECT COUNT(*) FROM sub_stat WHERE chat_id=? AND joined_at>=?', cid, t)}"
+                  f" · 7 kun {q('SELECT COUNT(*) FROM sub_stat WHERE chat_id=? AND joined_at>=?', cid, wk)})",
+                  f"➖ Chiqib ketgan: <b>{l}</b> (bugun {q('SELECT COUNT(*) FROM sub_stat WHERE chat_id=? AND left_at>=?', cid, t)})",
+                  f"👥 Hozir ichida: <b>{j - l}</b>",
+                  f"⏳ Obuna bo'lishi kutilmoqda: {q('SELECT COUNT(*) FROM sub_need WHERE chat_id=?', cid)}", ""]
+    if not channels():
+        lines.append("Majburiy kanal yo'q.")
+    else:
+        lines.append(f"Jami: ➕ {tj} · ➖ {tl} · 👥 {tj - tl}")
+    return "\n".join(lines)
+
+
+def soc_links() -> list:
+    return db.execute("SELECT * FROM soc_links ORDER BY id").fetchall()
+
+
+def soc_seen(uid: int) -> bool:
+    return bool(db.execute("SELECT 1 FROM soc_seen WHERE user_id=?", (uid,)).fetchone())
+
+
+def soc_parse(text: str):
+    """'https://instagram.com/x' yoki 'Nom | https://...' -> (tugma nomi, havola)."""
+    t, title = text.strip(), None
+    if "|" in t:
+        title, t = [x.strip() for x in t.split("|", 1)]
+    if t.startswith("@"):
+        t = "https://t.me/" + t[1:]
+    if not re.match(r"https?://", t, re.I):
+        if not re.match(r"[\w.-]+\.[a-z]{2,}(/|$)", t, re.I):
+            return None
+        t = "https://" + t
+    host = re.sub(r"^https?://(www\.)?", "", t, flags=re.I).split("/")[0].lower()
+    names = {"instagram.com": "📸 Instagram", "youtube.com": "▶️ YouTube", "youtu.be": "▶️ YouTube", "t.me": "✈️ Telegram",
+             "telegram.me": "✈️ Telegram", "tiktok.com": "🎵 TikTok", "facebook.com": "📘 Facebook", "fb.com": "📘 Facebook",
+             "twitter.com": "🐦 Twitter", "x.com": "🐦 X"}
+    base = next((v for k, v in names.items() if host == k or host.endswith("." + k)), "🔗 Havola")
+    return (f"{base.split(' ', 1)[0]} {title}" if title else base), t
+
+
 async def missing_channels(uid: int) -> list:
     if uid in ADMINS or time.time() - sub_cache.get(uid, 0) < 300:
         return []
@@ -280,6 +392,10 @@ async def missing_channels(uid: int) -> list:
             st = m.get("status")
             if st in ("left", "kicked") or (st == "restricted" and not m.get("is_member")):
                 miss.append(ch)
+                db.execute("INSERT OR IGNORE INTO sub_need(user_id, chat_id, ts) VALUES(?,?,?)", (uid, ch["chat_id"], time.time()))
+                db.commit()
+            else:
+                sub_joined(uid, ch["chat_id"])
         except Exception as e:  # noqa: BLE001
             # bot kanalda admin bo'lmasa tekshirib bo'lmaydi: foydalanuvchini to'smaymiz
             log.warning("obuna tekshiruvi (%s): %s", ch["chat_id"], e)
@@ -315,7 +431,8 @@ async def notify_main(uid: int, title: str) -> None:
 async def gate(uid: int, payload: str = "-") -> bool:
     """Obuna bo'lmagan bo'lsa kanallar ro'yxatini yuboradi va True qaytaradi."""
     miss = await missing_channels(uid)
-    if not miss:
+    socs = [] if uid in ADMINS or soc_seen(uid) else soc_links()
+    if not miss and not socs:
         if uid in ADMINS or has_phone(uid):
             return False
         if payload != "-":
@@ -327,8 +444,10 @@ async def gate(uid: int, payload: str = "-") -> bool:
                                "resize_keyboard": True, "one_time_keyboard": True})
         return True
     rows = [[ubtn(f"📢 {c['title']}", c["link"])] for c in miss]
+    rows += [[ubtn(x["title"], x["url"])] for x in socs]
     rows.append([btn("✅ Tekshirish", f"chk:{payload}")])
-    await send(uid, "Botdan foydalanish uchun avval quyidagi kanallarga obuna bo'ling, so'ng "
+    what = "kanallarga va sahifalarga" if miss and socs else ("kanallarga" if miss else "sahifalarimizga")
+    await send(uid, f"Botdan foydalanish uchun avval quyidagi {what} obuna bo'ling, so'ng "
                     "<b>✅ Tekshirish</b> tugmasini bosing:", kb(rows))
     return True
 
@@ -1398,17 +1517,29 @@ async def on_my_chat(mc: dict) -> None:
 
 
 # ---------- Avto-post: yuklangan animelarni e'lon kanallariga o'zi tashlab turadi ----------
-def ap_cfg() -> dict:
-    return {"on": get_set("ap_on", "0") == "1", "idle": int(get_set("ap_idle", "30") or 30),
-            "perday": int(get_set("ap_perday", "5") or 5), "mode": get_set("ap_mode", "rand"),
-            "from": int(get_set("ap_from", "0") or 0), "to": int(get_set("ap_to", "1440") or 1440)}
+def ap_cfg(cid: int | None = None) -> dict:
+    """Umumiy sozlama; cid berilsa, o'sha kanalning alohida belgilanganlari ustidan yoziladi."""
+    c = {"on": get_set("ap_on", "0") == "1", "idle": int(get_set("ap_idle", "30") or 30),
+         "perday": int(get_set("ap_perday", "5") or 5), "mode": get_set("ap_mode", "rand"),
+         "from": int(get_set("ap_from", "0") or 0), "to": int(get_set("ap_to", "1440") or 1440),
+         "days": get_set("ap_days", "1234567") or "1234567", "en": 1}
+    if cid is not None:
+        r = db.execute("SELECT * FROM ap_chan WHERE chat_id=?", (cid,)).fetchone()
+        if r:
+            for col, key in (("idle", "idle"), ("perday", "perday"), ("wf", "from"), ("wt", "to"),
+                             ("days", "days"), ("mode", "mode"), ("en", "en")):
+                if r[col] is not None:
+                    c[key] = r[col]
+    return c
 
 
 def ap_in_window(c: dict) -> bool:
+    n = now_local()
+    if str(n.isoweekday()) not in c.get("days", "1234567"):
+        return False
     f, t = c["from"], c["to"]
     if f == 0 and t >= 1440:
         return True
-    n = now_local()
     m = n.hour * 60 + n.minute
     return f <= m < t if f < t else (m >= f or m < t)
 
@@ -1493,13 +1624,15 @@ async def ap_post(cid: int, aid: int) -> None:
 
 
 async def ap_tick() -> None:
-    c = ap_cfg()
-    if not c["on"] or not ap_in_window(c):
+    if not ap_cfg()["on"]:
         return
     now, day = time.time(), today()
     db.execute("DELETE FROM ap_log WHERE ts < ?", (now - 14 * 86400,))
     for ch in news_channels():
         cid = ch["chat_id"]
+        c = ap_cfg(cid)
+        if not c["en"] or not ap_in_window(c):
+            continue
         if db.execute("SELECT COUNT(*) FROM ap_log WHERE chat_id=? AND day=?", (cid, day)).fetchone()[0] >= c["perday"]:
             continue
         last = db.execute("SELECT ts FROM ap_last WHERE chat_id=?", (cid,)).fetchone()
@@ -1524,6 +1657,10 @@ async def autoposter() -> None:
             await ap_tick()
         except Exception as e:  # noqa: BLE001
             log.error("autoposter: %r", e)
+        try:
+            await sub_audit()
+        except Exception as e:  # noqa: BLE001
+            log.error("sub_audit: %r", e)
         await asyncio.sleep(30)
 
 
@@ -1539,6 +1676,7 @@ def ap_text() -> str:
              f"Holat: {st}",
              f"⏱ Pauza: <b>{c['idle']} daqiqa</b> (kanalda oxirgi xabardan keyin shuncha jim bo'lsa yuboradi)",
              f"📅 Kuniga: <b>{c['perday']} ta</b> (har bir kanalga)",
+             f"📆 Kunlar: <b>{ap_days_label(c['days'])}</b>",
              f"🕗 Ish vaqti: <b>{ap_win_label(c)}</b> (hozir {now_local():%H:%M}, " + ("ichida ✅" if ap_in_window(c) else "tashqarida ⏸") + ")",
              f"🔀 Tartib: <b>{'tasodifiy' if c['mode'] == 'rand' else 'ketma-ket'}</b>",
              f"🎬 Aylanadigan animelar: <b>{n_an}</b> ta (qismi borlari)", ""]
@@ -1547,7 +1685,9 @@ def ap_text() -> str:
         lines.append("⚠️ E'lon kanali yo'q. «📣 E'lon kanallari» bo'limidan qo'shing.")
     for ch in chs:
         k = db.execute("SELECT COUNT(*) FROM ap_log WHERE chat_id=? AND day=?", (ch["chat_id"], day)).fetchone()[0]
-        lines.append(f"📣 {esc(ch['title'])}: bugun {k}/{c['perday']}")
+        cc = ap_cfg(ch["chat_id"])
+        lines.append(f"📣 {esc(ch['title'])}: bugun {k}/{cc['perday']} · {ap_win_label(cc)} · {ap_days_label(cc['days'])}"
+                     + ("" if cc["en"] else " · ⏸ o'chiq"))
     return "\n".join(lines)
 
 
@@ -1556,35 +1696,132 @@ def ap_kb() -> dict:
     return kb([[btn("🔴 O'chirish" if c["on"] else "🟢 Yoqish", "ad:apt")],
                [btn(f"⏱ Pauza: {c['idle']} daq", "ad:api"), btn(f"📅 Kuniga: {c['perday']}", "ad:apd")],
                [btn(f"🕗 Ish vaqti: {ap_win_label(c)}", "ad:apw")],
+               ap_days_row(0, c["days"]),
+               [btn("📣 Har bir kanal alohida sozlash", "ad:apc")],
                [btn("🔀 Tartib: tasodifiy" if c["mode"] == "rand" else "🔢 Tartib: ketma-ket", "ad:apm")],
                [btn("▶️ Hozir 1 ta yuborish", "ad:apn")], [btn("🔄 Aylanishni boshidan", "ad:apr")],
                [btn("🔙 Orqaga", "ad")]])
 
 
+DAYS_SHORT = ["Du", "Se", "Ch", "Pa", "Ju", "Sh", "Ya"]
+
+
+def ap_days_label(days: str) -> str:
+    return "har kuni" if len(set(days)) == 7 else ", ".join(DAYS_SHORT[int(d) - 1] for d in sorted(set(days)))
+
+
+def ap_days_row(cid: int, days: str) -> list:
+    return [btn(n + ("✅" if str(i + 1) in days else ""), f"ad:apdy:{cid}:{i + 1}") for i, n in enumerate(DAYS_SHORT)]
+
+
+def ap_set(cid: int, **kw) -> None:
+    db.execute("INSERT OR IGNORE INTO ap_chan(chat_id) VALUES(?)", (cid,))
+    for k, v in kw.items():
+        if k in ("en", "idle", "perday", "wf", "wt", "days", "mode"):
+            db.execute(f"UPDATE ap_chan SET {k}=? WHERE chat_id=?", (v, cid))
+    db.commit()
+
+
+def ap_toggle_day(cid: int, d: int) -> None:
+    cur = set(ap_cfg(cid or None)["days"])
+    cur ^= {str(d)}
+    if not cur:  # kamida bitta kun qolsin
+        return
+    new = "".join(sorted(cur))
+    if cid:
+        ap_set(cid, days=new)
+    else:
+        set_set("ap_days", new)
+
+
+def ap_prompt(kind: str) -> str:
+    return {"apidle": "⏱ Necha <b>daqiqa</b> jim turgandan keyin yuborsin? Yozing: <code>30</code>, <code>45 min</code>, "
+                      "<code>2 soat</code> yoki <code>1:30</code>.",
+            "apday": "📅 Kuniga nechta anime yuborsin? (1–100). Son yozing:",
+            "apwin": "🕗 Qaysi <b>soat oralig'ida</b> ishlasin? Masalan: <code>9-12</code>, <code>12-22</code>, "
+                     "<code>20:30-02:00</code> yoki faqat <code>20</code> (20:00 dan kun oxirigacha)."}[kind]
+
+
+def ap_chans_text() -> str:
+    lines = ["📣 <b>Avto-post: kanallar bo'yicha</b>", "",
+             "Har bir kanal uchun alohida ish vaqti, haftaning kunlari, kunlik soni va pauza belgilanadi. "
+             "Belgilanmaganlari umumiy sozlamadan olinadi.", ""]
+    chs = news_channels()
+    for ch in chs:
+        cc = ap_cfg(ch["chat_id"])
+        lines.append(f"📣 {esc(ch['title'])}: {ap_win_label(cc)} · {ap_days_label(cc['days'])} · {cc['perday']} ta"
+                     + ("" if cc["en"] else " · ⏸"))
+    if not chs:
+        lines.append("⚠️ E'lon kanali yo'q. «📣 E'lon kanallari» dan qo'shing.")
+    return "\n".join(lines)
+
+
+def ap_chans_kb() -> dict:
+    rows = [[btn(f"📣 {ch['title']}"[:50], f"ad:apcc:{ch['chat_id']}")] for ch in news_channels()]
+    return kb(rows + [[btn("🔙 Avto-post", "ad:ap")]])
+
+
+def ap_chan_text(cid: int) -> str:
+    row = db.execute("SELECT title FROM news_channels WHERE chat_id=?", (cid,)).fetchone()
+    c = ap_cfg(cid)
+    cr = db.execute("SELECT * FROM ap_chan WHERE chat_id=?", (cid,)).fetchone()
+
+    def own(col: str) -> str:
+        return "" if cr and cr[col] is not None else " <i>(umumiy)</i>"
+
+    k = db.execute("SELECT COUNT(*) FROM ap_log WHERE chat_id=? AND day=?", (cid, today())).fetchone()[0]
+    st = "🟢 yoqilgan" if c["en"] else "🔴 o'chiq"
+    return "\n".join([f"📣 <b>{esc(row['title'] if row else str(cid))}</b> — avto-post", "",
+                      f"Holat: {st}{own('en')}", f"🕗 Ish vaqti: <b>{ap_win_label(c)}</b>{own('wf')}",
+                      f"📆 Kunlar: <b>{ap_days_label(c['days'])}</b>{own('days')}",
+                      f"📅 Kuniga: <b>{c['perday']} ta</b>{own('perday')} (bugun {k})",
+                      f"⏱ Pauza: <b>{c['idle']} daqiqa</b>{own('idle')}", "",
+                      "Umumiy avto-post yoqilgan bo'lishi kerak (🤖 Avto-post)."])
+
+
+def ap_chan_kb(cid: int) -> dict:
+    c = ap_cfg(cid)
+    return kb([[btn("🔴 Bu kanalda o'chirish" if c["en"] else "🟢 Bu kanalda yoqish", f"ad:apct:{cid}")],
+               [btn(f"🕗 Ish vaqti: {ap_win_label(c)}", f"ad:apcw:{cid}")],
+               ap_days_row(cid, c["days"]),
+               [btn(f"📅 Kuniga: {c['perday']}", f"ad:apcd:{cid}"), btn(f"⏱ Pauza: {c['idle']} daq", f"ad:apci:{cid}")],
+               [btn("↩️ Umumiy sozlamaga qaytarish", f"ad:apcr:{cid}")],
+               [btn("🔙 Kanallar", "ad:apc")]])
+
+
 async def ap_state(uid: int, msg: dict, st: dict) -> bool:
     text = (msg.get("text") or "").strip()
-    if st["s"] == "apwin":
+    cid = st.get("cid")
+    cancel = kb([[btn("❌ Bekor qilish", f"ad:apcc:{cid}" if cid else "ad:ap")]])
+    kind = st["s"]
+    if kind == "apwin":
         w = parse_window(text)
         if not w:
-            await send(uid, "❌ Masalan: <code>20-23</code>, <code>20:30-02:00</code>, <code>20</code> yoki <code>hamma</code>.",
-                       kb([[btn("❌ Bekor qilish", "ad:ap")]]))
+            await send(uid, "❌ Masalan: <code>9-12</code>, <code>20:30-02:00</code>, <code>20</code> yoki <code>hamma</code>.", cancel)
             return True
-        set_set("ap_from", str(w[0]))
-        set_set("ap_to", str(w[1]))
-    elif st["s"] == "apidle":
+        own, glob = {"wf": w[0], "wt": w[1]}, {"ap_from": str(w[0]), "ap_to": str(w[1])}
+    elif kind == "apidle":
         sec = parse_dur(text)
         if not sec or sec < 60 or sec > 7 * 86400:
             await send(uid, "❌ Pauzani yozing: <code>30</code> (daqiqa), <code>45 min</code>, <code>2 soat</code> "
-                            "yoki <code>1:30</code> (kamida 1 daqiqa).", kb([[btn("❌ Bekor qilish", "ad:ap")]]))
+                            "yoki <code>1:30</code> (kamida 1 daqiqa).", cancel)
             return True
-        set_set("ap_idle", str(sec // 60))
+        own, glob = {"idle": sec // 60}, {"ap_idle": str(sec // 60)}
     else:
         if not text.isdigit() or not 1 <= int(text) <= 100:
-            await send(uid, "❌ 1 dan 100 gacha son yozing.", kb([[btn("❌ Bekor qilish", "ad:ap")]]))
+            await send(uid, "❌ 1 dan 100 gacha son yozing.", cancel)
             return True
-        set_set("ap_perday", text)
+        own, glob = {"perday": int(text)}, {"ap_perday": text}
+    if cid:
+        ap_set(cid, **own)
+    else:
+        for k, v in glob.items():
+            set_set(k, v)
     state.pop(uid, None)
-    await send(uid, ap_text(), ap_kb())
+    if cid:
+        await send(uid, ap_chan_text(cid), ap_chan_kb(cid))
+    else:
+        await send(uid, ap_text(), ap_kb())
     return True
 
 
@@ -1648,6 +1885,36 @@ async def on_admin_cb(uid: int, msg: dict, data: str) -> None:
                "<code>1:30</code>." if sub == "api" else
                "📅 Kuniga nechta anime yuborsin? (har bir kanalga, 1–100). Son yozing:")
         await show(uid, mid, ask, kb([[btn("❌ Bekor qilish", "ad:ap")]]))
+
+    elif sub == "apc":
+        await show(uid, mid, ap_chans_text(), ap_chans_kb())
+
+    elif sub == "apcc":
+        await show(uid, mid, ap_chan_text(int(p[2])), ap_chan_kb(int(p[2])))
+
+    elif sub in ("apci", "apcd", "apcw"):
+        c_ = int(p[2])
+        state[uid] = {"s": {"apci": "apidle", "apcd": "apday", "apcw": "apwin"}[sub], "cid": c_}
+        await show(uid, mid, ap_prompt(state[uid]["s"]), kb([[btn("❌ Bekor qilish", f"ad:apcc:{c_}")]]))
+
+    elif sub == "apct":
+        c_ = int(p[2])
+        ap_set(c_, en=0 if ap_cfg(c_)["en"] else 1)
+        await show(uid, mid, ap_chan_text(c_), ap_chan_kb(c_))
+
+    elif sub == "apcr":
+        c_ = int(p[2])
+        db.execute("DELETE FROM ap_chan WHERE chat_id=?", (c_,))
+        db.commit()
+        await show(uid, mid, ap_chan_text(c_), ap_chan_kb(c_))
+
+    elif sub == "apdy":
+        c_ = int(p[2])
+        ap_toggle_day(c_, int(p[3]))
+        if c_:
+            await show(uid, mid, ap_chan_text(c_), ap_chan_kb(c_))
+        else:
+            await show(uid, mid, ap_text(), ap_kb())
 
     elif sub == "apw":
         state[uid] = {"s": "apwin"}
@@ -1793,12 +2060,37 @@ async def on_admin_cb(uid: int, msg: dict, data: str) -> None:
         await on_admin_cb(uid, msg, f"ad:epl:{aid}")
 
     elif sub == "ch":
-        chs = channels()
+        chs, socs = channels(), soc_links()
         rows = [[btn(f"🗑 {c['title']}"[:50], f"ad:chdel:{c['id']}")] for c in chs]
-        rows.append([btn("➕ Kanal qo'shish", "ad:chadd")])
-        rows.append([btn("🔙 Orqaga", "ad")])
-        await show(uid, mid, "📢 <b>Majburiy obuna kanallari</b>\n" + (
-            "Kanalni o'chirish uchun uning tugmasini bosing." if chs else "\nHozircha kanal yo'q."), kb(rows))
+        rows += [[btn(f"🗑 {x['title']}"[:50], f"ad:socd:{x['id']}")] for x in socs]
+        rows += [[btn("➕ Kanal qo'shish", "ad:chadd")], [btn("➕ Havola qo'shish (Instagram, YouTube...)", "ad:soca")],
+                 [btn("📊 Obuna statistikasi", "ad:chs")], [btn("🔙 Orqaga", "ad")]]
+        lines = ["📢 <b>Majburiy obuna</b>", ""]
+        for c in chs:
+            j_, l_ = sub_counts(c["chat_id"])
+            lines.append(f"📣 {esc(c['title'])} — ➕ {j_} · ➖ {l_}")
+        for x in socs:
+            lines.append(f"{esc(x['title'])} — {esc(x['url'])}")
+        lines += ["", "O'chirish uchun tugmasini bosing." if chs or socs else "Hozircha yo'q.",
+                  "➕/➖: bot orqali qo'shilgan / chiqib ketganlar soni."]
+        await show(uid, mid, "\n".join(lines), kb(rows))
+
+    elif sub == "chs":
+        await show(uid, mid, sub_stats_text(), kb([[btn("🔄 Yangilash", "ad:chs")], [btn("🔙 Orqaga", "ad:ch")]]))
+
+    elif sub == "soca":
+        state[uid] = {"s": "soc"}
+        await show(uid, mid, "➕ <b>Havola qo'shish</b> (Instagram, YouTube, TikTok, Telegram...)\n\nHavolani yuboring:\n"
+                             "<code>https://instagram.com/sahifa</code>\n\nTugma nomini o'zingiz qo'ymoqchi bo'lsangiz:\n"
+                             "<code>Bizning Instagram | https://instagram.com/sahifa</code>\n\n"
+                             "⚠️ Havolaga obuna bo'lganini bot tekshira olmaydi: foydalanuvchi havolani ko'rib "
+                             "«✅ Tekshirish» ni bosadi. Hozirgi foydalanuvchilarga ham bir marta ko'rsatiladi.",
+                   kb([[btn("❌ Bekor qilish", "ad:ch")]]))
+
+    elif sub == "socd":
+        db.execute("DELETE FROM soc_links WHERE id=?", (int(p[2]),))
+        db.commit()
+        await on_admin_cb(uid, msg, "ad:ch")
 
     elif sub == "chadd":
         state[uid] = {"s": "chadd"}
@@ -2097,6 +2389,15 @@ async def admin_state(uid: int, msg: dict) -> bool:
                         f"⏭ Keyingi yuborish: <b>{row['next_run']}</b>\n\n"
                         "⚠️ Rejalangan xabarni shu suhbatdan o'chirmang, aks holda yuborilmaydi.",
                    kb([[btn("⏰ Rejalangan xabarlar", "ad:sl")]]))
+    elif s == "soc":
+        r_ = soc_parse(text)
+        if not r_:
+            await send(uid, "❌ Havolani yuboring: <code>https://instagram.com/sahifa</code> yoki <code>Nom | havola</code>")
+            return True
+        db.execute("INSERT INTO soc_links(title, url) VALUES(?,?)", r_)
+        db.commit()
+        state.pop(uid, None)
+        await send(uid, f"✅ Qo'shildi: {esc(r_[0])}", kb([[btn("📢 Majburiy obuna", "ad:ch")]]))
     elif s in ("chadd", "news"):
         ref = chat_ref(msg)
         if ref is None:
@@ -2227,6 +2528,8 @@ async def on_callback(cb: dict) -> None:
         if await missing_channels(uid):
             await answer("❌ Hali hamma kanalga obuna bo'lmagansiz.", True)
             return
+        db.execute("INSERT OR IGNORE INTO soc_seen(user_id) VALUES(?)", (uid,))
+        db.commit()
         await answer("✅ Rahmat!")
         if mid:
             await safe("deleteMessage", chat_id=uid, message_id=mid)
@@ -2291,6 +2594,8 @@ async def handle_update(u: dict) -> None:
         await on_callback(u["callback_query"])
     elif "message" in u:
         await on_message(u["message"])
+    elif "chat_member" in u:
+        await on_chat_member(u["chat_member"])
     elif "channel_post" in u:
         note_msg(u["channel_post"])
     elif "my_chat_member" in u:
@@ -2758,7 +3063,7 @@ async def web_conn(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -
         writer.close()
 
 
-ALLOWED = ["message", "callback_query", "my_chat_member", "channel_post"]
+ALLOWED = ["message", "callback_query", "my_chat_member", "channel_post", "chat_member"]
 
 
 async def serve_webhook() -> None:
